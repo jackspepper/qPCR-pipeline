@@ -1,0 +1,573 @@
+---
+title: "Auditable qPCR Cleaning with tidyqpcr (v5: multi‑plate)"
+format:
+  html:
+    toc: true
+    code-fold: true
+    css: styles.css
+execute:
+  echo: true
+  warning: false
+  message: false
+params:
+  # --- INPUTS ---
+  input_dir: "data_raw"          # folder with plates
+  file_pattern: "\\.csv$"       # regex for files to include
+  files: null                     # optional explicit vector of files; overrides input_dir + pattern
+
+  # --- OUTPUTS ---
+  output_dir: "outputs"
+  log_path: "audit/pcr_decisions.csv"
+
+  # --- QC THRESHOLDS ---
+  LOD_Lo: 0.012
+  LOD_Hi: 2000
+  delta_cq_threshold: 1.0
+
+  # --- OPTIONAL REMOVAL BY PATTERN ---
+  rm_pattern: ["OM"]        # e.g., ["OM", "^CTRL", "_test$"]
+  rm_columns: ["sample"]    # e.g., ["sample","content"]
+  enable_preview: false     # show preview tables for regex removal
+  dry_run: false            # do NOT remove rows; only preview/log summary
+  debug_print: false
+
+  # --- REPORT LAYOUT ---
+  pagebreak_each_plate: false
+---
+
+## Overview
+
+This document processes **multiple plates** in a folder, treating **each file as an isolated run**. Results are **not combined**: every plate gets its **own section**, its **own output CSVs** named from the file stem, and all decisions are append‑logged with the **input file name** for traceability (MIQE‑aligned foundations via **tidyqpcr**).\
+It also supports **regex‑based removal** with **preview** and **dry‑run** modes.
+
+::: callout-tip
+**Tip** — Configure which files to run in the YAML params: set `files:` explicitly, or use `input_dir` + `file_pattern`.
+:::
+
+```{=html}
+<style>
+.plate-section {margin-block: 1.25rem}
+
+.page-break {break-after: page; page-break-after: always}
+</style>
+```
+
+## Setup
+
+```{r}
+library(tidyverse)
+library(readr)
+library(lubridate)
+library(janitor)
+library(tidyqpcr)  # tidy, MIQE-aware workflow foundation
+library(tools)
+library(htmltools)
+library(gt)
+library(knitr)
+```
+
+### Helpers: logging (includes per-plate input file), reading, and processing
+
+```{r}
+# ---- Logging helpers ----
+ensure_log_store <- function(path) {
+  if (!dir.exists(dirname(path))) dir.create(dirname(path), recursive = TRUE)
+  if (!file.exists(path)) {
+    write_csv(
+      tibble(
+        timestamp  = as_datetime(character()),
+        user       = Sys.info()[["user"]],
+        run_id     = character(),
+        input_file = character(),
+        sample_id  = character(),
+        target     = character(),
+        rule_id    = character(),
+        outcome    = character(),
+        evidence   = character(),
+        source     = "quarto"
+      ),
+      path
+    )
+  }
+  invisible(path)
+}
+
+# The current input file name can change per-plate; pick it up from a global-like var if present
+.resolve_input_file <- function(default_file) {
+  val <- get0(".current_input_file", envir = .GlobalEnv, inherits = FALSE)
+  if (is.null(val)) basename(default_file) else basename(val)
+}
+
+log_decision <- function(sample_id, target, rule_id, outcome, evidence,
+                         run_id, log_path, default_file) {
+  ensure_log_store(log_path)
+  entry <- tibble(
+    timestamp  = now(tzone = "UTC"),
+    user       = Sys.info()[["user"]],
+    run_id     = run_id,
+    input_file = .resolve_input_file(default_file),
+    sample_id  = as.character(sample_id %||% NA_character_),
+    target     = as.character(target %||% NA_character_),
+    rule_id    = rule_id,
+    outcome    = outcome,
+    evidence   = evidence,
+    source     = "quarto"
+  )
+  write_csv(entry, log_path, append = TRUE)
+  invisible(entry)
+}
+
+# ---- Core processing for a single plate file ----
+process_plate <- function(file,
+                          LOD_Lo, LOD_Hi, dCq_thr,
+                          rm_patterns, rm_cols_req,
+                          enable_preview, dry_run, debug_print,
+                          output_dir, log_path) {
+  assign(".current_input_file", file, envir = .GlobalEnv)
+
+  stem   <- tools::file_path_sans_ext(basename(file))
+  run_id <- paste0(format(Sys.time(), "%Y%m%d_%H%M%S"), "_", stem)
+
+  # Import
+  raw <- read_csv(file, show_col_types = FALSE)
+  raw <- raw[19:nrow(raw), ]
+  colnames(raw) <- raw[1, ]
+  raw <- raw[2:nrow(raw), ]
+  
+  raw <- raw %>%
+    janitor::clean_names()
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `raw`")
+    print(head(raw))
+  }
+  
+  stopifnot(all(c("well","fluor","target","content","sample","cq","starting_quantity_sq") %in% names(raw)))
+  dat <- raw %>% mutate(
+    cq_num = suppressWarnings(as.numeric(cq)),
+    sq_raw = suppressWarnings(as.numeric(starting_quantity_sq))
+  )
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `dat`")
+    print(head(dat))
+  }
+  
+  # Step 0: Removal of unnamed samples
+  dat <- dat %>%
+    mutate(
+        sample_reason = case_when(
+            is.na(sample) ~ "RM_Sample_removed_due_to_absent_name",
+            TRUE ~ NA_character_
+            ))
+  
+  dat %>%
+    filter(!is.na(.data$sample_reason)) %>%
+    rowwise() %>%
+    do({
+      log_decision(.$sample, .$target, .$sample_reason, "applied",
+                   paste0("Removed due to absent sample name"),
+                   run_id, log_path, file)
+      tibble(.)
+    }) %>% invisible()
+  
+  dat <- dat %>%
+    filter(is.na(sample_reason))
+
+  # Step 1: SQ adjust
+  dat1 <- dat %>%
+    mutate(
+      sq_adj = case_when(
+        is.na(sq_raw) | is.nan(sq_raw) ~ LOD_Lo/2,
+        sq_raw < LOD_Lo                ~ LOD_Lo/2,
+        TRUE                           ~ sq_raw
+      ),
+      sq_adj_reason = case_when(
+        is.na(sq_raw) | is.nan(sq_raw) ~ "ADJ2:SQ_NA_to_half_LOD_Lo",
+        sq_raw < LOD_Lo                ~ "ADJ1:SQ_below_LOD_Lo_to_half",
+        TRUE                           ~ NA_character_
+      )
+    )
+  
+  #### TODO: Add in per specieis LOD (Lo and Hi) dict
+
+  dat1 %>%
+    filter(!is.na(.data$sq_adj_reason)) %>%
+    rowwise() %>%
+    do({
+      log_decision(.$sample, .$target, .$sq_adj_reason, "applied",
+                   paste0("sq_raw=", .$sq_raw, "; LOD_Lo=", LOD_Lo),
+                   run_id, log_path, file)
+      tibble(.)
+    }) %>% invisible()
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `dat1 step1`")
+    print(head(dat1))
+  }
+
+  # Step 2: Optional removal by regex pattern
+  if (!is.null(rm_patterns) && length(rm_patterns) > 0) {
+    rm_cols <- intersect(tolower(rm_cols_req), names(dat1))
+    if (length(rm_cols) > 0) {
+      combined_pat <- paste(rm_patterns, collapse = "|")
+      re <- stringr::regex(combined_pat, ignore_case = TRUE)
+
+      dat1 <- dat1 %>%
+        mutate(rm_hit = if_any(all_of(rm_cols), ~ stringr::str_detect(as.character(.x), re)))
+
+      if (isTRUE(enable_preview)) {
+        rm_preview_counts <- dat1 %>% summarise(total_rows = n(), n_matches = sum(rm_hit, na.rm = TRUE),
+                                                pct_matches = round(100 * n_matches / total_rows, 2))
+        rm_counts_by_col <- map_dfr(rm_cols, function(cl) {
+          tibble(column = cl,
+                 n_matches = sum(stringr::str_detect(as.character(dat1[[cl]]), re), na.rm = TRUE))
+        }) %>% arrange(desc(n_matches))
+        rm_examples <- dat1 %>% filter(rm_hit) %>% select(well, fluor, target, content, sample, cq, starting_quantity_sq) %>% head(20)
+
+        # Print preview tables to report
+        cat("\n**Removal preview (", stem, ")**\n\n", sep = "")
+        print(rm_preview_counts)
+        print(rm_counts_by_col)
+        print(rm_examples)
+
+        # Log run-level preview
+        log_decision(NA, NA, "RM_PATTERN", "preview",
+                     paste0("patterns=", combined_pat, "; cols=", paste(rm_cols, collapse=","),
+                            "; n_matches=", rm_preview_counts$n_matches),
+                     run_id, log_path, file)
+      }
+
+      if (isTRUE(dry_run)) {
+        n_hits <- sum(dat1$rm_hit, na.rm = TRUE)
+        log_decision(NA, NA, "RM_PATTERN", "dry_run",
+                     paste0("patterns=", combined_pat, "; cols=", paste(rm_cols, collapse=","),
+                            "; n_matches=", n_hits),
+                     run_id, log_path, file)
+        dat1 <- dat1 %>% select(-rm_hit)
+      } else {
+        dat1 %>% filter(rm_hit) %>% rowwise() %>% do({
+          log_decision(.$sample, .$target, "RM_PATTERN", "applied",
+                       paste0("cols=", paste(rm_cols, collapse=","), "; pattern=", combined_pat),
+                       run_id, log_path, file)
+          tibble(.)
+        }) %>% invisible()
+        dat1 <- dat1 %>% filter(!rm_hit) %>% select(-rm_hit)
+      }
+    }
+  }
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `dat1 step2`")
+    print(head(dat1))
+  }
+
+  # Step 3: Sample naming consistency within (Fluor, Target, Content)
+  name_checks <- dat1 %>%
+    group_by(fluor, target, content) %>%
+    summarise(n_samples = n_distinct(sample),
+              samples   = paste(sort(unique(sample)), collapse = "|"), .groups = "drop") %>%
+    mutate(flag_name_mismatch = n_samples > 1)
+
+  name_checks %>% filter(flag_name_mismatch) %>% rowwise() %>% do({
+    log_decision(NA, .$target, "QC_SN_MISMATCH", "applied",
+                 paste0("content=", .$content, "; samples=", .$samples),
+                 run_id, log_path, file)
+    tibble(.)
+  }) %>% invisible()
+
+  dat2 <- dat1 %>%
+    left_join(name_checks %>% select(fluor, target, content, flag_name_mismatch),
+              by = c("fluor","target","content")) %>%
+    mutate(flag_name_mismatch = replace_na(flag_name_mismatch, FALSE))
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `dat1 step3`")
+    print(head(dat1))
+  }
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `dat2 step3`")
+    print(head(dat2))
+  }
+
+  # Steps 4 & 5: AverageSQ, DeltaCq, replicate health
+  rep_key <- c("fluor","target","sample")
+
+  rep_summary <- dat2 %>%
+    group_by(across(all_of(rep_key))) %>%
+    summarise(
+      n_rows     = n(),
+      n_num_cq   = sum(!is.na(cq_num) & !is.nan(cq_num)),
+      cq_vals    = list(cq_num[!is.na(cq_num) & !is.nan(cq_num)]),
+      delta_cq   = if (length(cq_vals[[1]]) == 2) abs(diff(range(cq_vals[[1]]))) else NA_real_,
+      avg_sq     = mean(sq_adj, na.rm = TRUE),
+      both_cq_na = (n_num_cq == 0),
+      one_cq_na  = (n_num_cq == 1 & n_rows >= 2),
+      single_rep = (n_rows == 1),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      rv_single_rep   = single_rep,
+      rv_delta_cq     = !is.na(delta_cq) & (delta_cq > dCq_thr) & (avg_sq > LOD_Lo),
+      rv_mixed_na_num = one_cq_na,
+      pass_negative   = both_cq_na,
+      rv_high_sq      = avg_sq > LOD_Hi
+    )
+
+  rep_summary %>% rowwise() %>% do({
+    if (.$rv_single_rep)
+      log_decision(.$sample, .$target, "RV_SINGLE_REP", "applied",
+                   paste0("n_rows=", .$n_rows), run_id, log_path, file)
+    else
+      log_decision(.$sample, .$target, "RV_SINGLE_REP", "skipped",
+                   paste0("n_rows=", .$n_rows), run_id, log_path, file)
+
+    if (!is.na(.$delta_cq) && (.$delta_cq > dCq_thr) && (.$avg_sq > LOD_Lo))
+      log_decision(.$sample, .$target, "RV_DELTA_CQ", "applied",
+                   paste0("|DeltaCq|=", .$delta_cq, "; thr=", dCq_thr,
+                          "; avg_sq=", .$avg_sq, "; LOD_Lo=", LOD_Lo),
+                   run_id, log_path, file)
+    else
+      log_decision(.$sample, .$target, "RV_DELTA_CQ", "skipped",
+                   paste0("|DeltaCq|=", .$delta_cq, "; thr=", dCq_thr,
+                          "; avg_sq=", .$avg_sq),
+                   run_id, log_path, file)
+
+    if (.$rv_mixed_na_num)
+      log_decision(.$sample, .$target, "RV_MIXED_CQ", "applied",
+                   paste0("n_num_cq=", .$n_num_cq, "; n_rows=", .$n_rows),
+                   run_id, log_path, file)
+    else
+      log_decision(.$sample, .$target, "RV_MIXED_CQ", "skipped",
+                   paste0("n_num_cq=", .$n_num_cq), run_id, log_path, file)
+
+    if (.$pass_negative)
+      log_decision(.$sample, .$target, "PASS_NEGATIVE", "pass",
+                   "both Cq are NA/NaN", run_id, log_path, file)
+
+    if (.$rv_high_sq)
+      log_decision(.$sample, .$target, "RV_HIGH_SQ", "applied",
+                   paste0("avg_sq=", .$avg_sq, "; LOD_Hi=", LOD_Hi),
+                   run_id, log_path, file)
+    else
+      log_decision(.$sample, .$target, "RV_HIGH_SQ", "skipped",
+                   paste0("avg_sq=", .$avg_sq), run_id, log_path, file)
+
+    tibble(.)
+  }) %>% invisible()
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `rep_summary`")
+    print(head(rep_summary))
+  }
+
+  # Collate & present only on first replicate row
+  dat3 <- dat2 %>%
+    left_join(rep_summary %>%
+                select(all_of(rep_key), delta_cq, avg_sq, both_cq_na,
+                       rv_single_rep, rv_delta_cq, rv_mixed_na_num, rv_high_sq),
+              by = rep_key) %>%
+    mutate(flag_name_mismatch = coalesce(flag_name_mismatch, FALSE))
+
+  reason_map <- tribble(
+      ~flag,               ~reason,
+    "flag_name_mismatch","Sample name mismatch within (Fluor, Target, Content)",
+    "rv_single_rep",     "Only one replicate present",
+    "rv_delta_cq",       "|DeltaCq| greater than threshold AND AverageSQ > LOD_Lo",
+    "rv_mixed_na_num",   "One Cq is NA/NaN and the other numeric",
+    "rv_high_sq",        "AverageSQ > LOD_Hi"
+  )
+
+  review_cols <- c("flag_name_mismatch","rv_single_rep","rv_delta_cq","rv_mixed_na_num","rv_high_sq")
+
+  dat3 <- dat3 %>% mutate(
+    needs_review = if_any(all_of(review_cols), ~ .x),
+    review_reason = pmap_chr(
+      pick(all_of(review_cols)),
+      function(...) {
+        flags_logical <- c(...)
+        flags <- review_cols[flags_logical]
+        if (length(flags) == 0) return(NA_character_)
+        reasons <- reason_map$reason[match(flags, reason_map$flag)]
+        paste(reasons, collapse = " ; ")
+      }
+    )
+  )
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `dat3`")
+    print(head(dat3))
+  }
+
+  dat4 <- dat3 %>%
+    group_by(across(all_of(rep_key))) %>% arrange(well, .by_group = TRUE) %>%
+    mutate(rep_idx = row_number()) %>% ungroup()
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `dat4`")
+    print(head(dat4))
+  }
+
+  needs_review_grp <- dat4 %>%
+    group_by(across(all_of(rep_key))) %>% summarise(needs_review_grp = any(needs_review), .groups = "drop")
+
+  dat_out <- dat4 %>% mutate(
+    out_delta_cq   = if_else(rep_idx == 1, delta_cq, NA_real_),
+    out_average_sq = if_else(rep_idx == 1, avg_sq,   NA_real_),
+    out_reason     = if_else(rep_idx == 1, review_reason, NA_character_)
+  ) %>% left_join(needs_review_grp, by = rep_key)
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `dat_out`")
+    print(head(dat_out))
+  }
+
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+  all_path    <- file.path(output_dir, paste0(stem, "_all_samples.csv"))
+  review_path <- file.path(output_dir, paste0(stem, "_review_samples.csv"))
+
+  all_samples <- dat_out %>% transmute(
+    Well   = well,
+    Fluor  = fluor,
+    Target = target,
+    Content= content,
+    Sample = sample,
+    Cq     = cq,
+    `Starting Quantity (SQ)` = sq_adj,
+    DeltaCq   = out_delta_cq,
+    AverageSQ = out_average_sq,
+    review_reason = out_reason
+  )
+  
+  if(isTRUE(debug_print)) {
+    print("Table: `all_samples`")
+    print(head(all_samples))
+  }
+
+  review_samples <- all_samples %>%
+    left_join(dat_out %>% select(well, fluor, target, sample, needs_review_grp),
+              by = c("Well"="well","Fluor"="fluor","Target"="target","Sample"="sample")) %>%
+    filter(needs_review_grp) %>% select(-needs_review_grp)
+
+  if(isTRUE(debug_print)) {
+    print("Table: `review_samples`")
+    print(head(review_samples))
+  }
+
+  write_csv(all_samples, all_path)
+  write_csv(review_samples, review_path)
+
+  list(
+    stem = stem,
+    all_path = all_path,
+    review_path = review_path,
+    n_in = nrow(raw),
+    n_out = nrow(all_samples),
+    n_review = nrow(review_samples),
+    preview_enabled = isTRUE(enable_preview),
+    dry_run = isTRUE(dry_run)
+  )
+}
+```
+
+### Discover plate files to process
+
+```{r}
+plate_files <- if (!is.null(params$files)) {
+  # explicit vector supplied
+  as.character(params$files)
+} else {
+  list.files(params$input_dir, pattern = params$file_pattern, full.names = TRUE)
+}
+
+validate <- file.exists(plate_files)
+if (length(plate_files) == 0L || !all(validate)) {
+  stop("No input files found (or some files do not exist). Check params$files / params$input_dir / params$file_pattern.")
+}
+
+plate_files
+```
+
+## Per-plate processing
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| results: asis
+
+render_plate_section <- function(stem, res) {
+  summary_tbl <- tibble(
+    File                 = basename(res$file),
+    `Rows (input)`       = res$n_in,
+    `Rows (output)`      = res$n_out,
+    `Rows (review)`      = res$n_review,
+    `All samples CSV`    = res$all_path,
+    `Review samples CSV` = res$review_path
+  )
+
+  gt_tbl <- summary_tbl %>%
+    gt() %>%
+    tab_header(
+      title = md("**Plate summary**"),
+      subtitle = md(paste0("*", stem, "*"))
+    ) %>%
+    cols_align(align = "left", columns = everything()) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_column_labels(everything())
+    ) %>%
+    fmt_integer(columns = c(`Rows (input)`, `Rows (output)`, `Rows (review)`)) %>%
+    opt_table_outline() %>%
+    tab_options(table.font.size = px(14), data_row.padding = px(6))
+
+  # Start fenced div with a class for styling/layout if desired
+  knitr::asis_output('::: {.plate-section}\n')
+
+  # Heading: use markdown so it’s portable across HTML and PDF
+  knitr::asis_output(paste0("## Plate: ", stem, "\n\n"))
+
+  # Print the gt table (in asis mode it will emit HTML/LaTeX appropriately)
+  print(gt_tbl)
+
+  # Close fenced div
+  knitr::asis_output("\n:::\n")
+}
+
+for (i in seq_along(plate_files)) {
+  f    <- plate_files[[i]]
+  stem <- tools::file_path_sans_ext(basename(f))
+
+  res <- process_plate(
+    file = f,
+    LOD_Lo = params$LOD_Lo, LOD_Hi = params$LOD_Hi, dCq_thr = params$delta_cq_threshold,
+    rm_patterns = params$rm_pattern, rm_cols_req = params$rm_columns,
+    enable_preview = params$enable_preview, dry_run = params$dry_run,
+    debug_print = params$debug_print, output_dir = params$output_dir,
+    log_path = params$log_path
+  )
+  # Keep the file path for the table
+  res$file <- f
+
+  render_plate_section(stem, res)
+
+  # Optional page break between sections
+  if (isTRUE(params$pagebreak_each_plate) && i < length(plate_files)) {
+    if (knitr::is_html_output()) {
+      knitr::asis_output("\n<div class='page-break'></div>\n")
+    } else if (knitr::is_latex_output()) {
+      knitr::asis_output("\n\\newpage\n")
+    }
+  }
+}
+```
+
+## Appendix — Latest audit entries & counts (all plates in this run)
+
+```{r}
+audit <- read_csv(params$log_path, show_col_types = FALSE)
+audit %>% arrange(desc(timestamp)) %>% head(30)
+
+audit %>% count(input_file, rule_id, outcome, sort = TRUE)
+```
