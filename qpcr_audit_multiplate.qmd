@@ -60,9 +60,6 @@ library(lubridate)
 library(janitor)
 library(tidyqpcr)  # tidy, MIQE-aware workflow foundation
 library(tools)
-library(htmltools)
-library(gt)
-library(knitr)
 ```
 
 ### LOD Limits Per Target
@@ -761,45 +758,6 @@ plate_files
 #| echo: false
 #| message: false
 #| warning: false
-#| results: asis
-
-render_plate_section <- function(stem, res) {
-  summary_tbl <- tibble(
-    File                 = basename(res$file),
-    `Rows (input)`       = res$n_in,
-    `Rows (output)`      = res$n_out,
-    `Rows (review)`      = res$n_review,
-    `All samples CSV`    = res$all_path,
-    `Review samples CSV` = res$review_path
-  )
-
-  gt_tbl <- summary_tbl %>%
-    gt() %>%
-    tab_header(
-      title = md("**Plate summary**"),
-      subtitle = md(paste0("*", stem, "*"))
-    ) %>%
-    cols_align(align = "left", columns = everything()) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_column_labels(everything())
-    ) %>%
-    fmt_integer(columns = c(`Rows (input)`, `Rows (output)`, `Rows (review)`)) %>%
-    opt_table_outline() %>%
-    tab_options(table.font.size = px(14), data_row.padding = px(6))
-
-  # Start fenced div with a class for styling/layout if desired
-  knitr::asis_output('::: {.plate-section}\n')
-
-  # Heading: use markdown so it’s portable across HTML and PDF
-  knitr::asis_output(paste0("## Plate: ", stem, "\n\n"))
-
-  # Print the gt table (in asis mode it will emit HTML/LaTeX appropriately)
-  print(gt_tbl)
-
-  # Close fenced div
-  knitr::asis_output("\n:::\n")
-}
 
 for (i in seq_along(plate_files)) {
   f    <- plate_files[[i]]
@@ -812,19 +770,6 @@ for (i in seq_along(plate_files)) {
     debug_print = params$debug_print, output_dir = params$output_dir,
     dec_log_path = params$dec_log_path, var_log_path = params$var_log_path
   )
-  # Keep the file path for the table
-  res$file <- f
-
-  render_plate_section(stem, res)
-
-  # Optional page break between sections
-  if (isTRUE(params$pagebreak_each_plate) && i < length(plate_files)) {
-    if (knitr::is_html_output()) {
-      knitr::asis_output("\n<div class='page-break'></div>\n")
-    } else if (knitr::is_latex_output()) {
-      knitr::asis_output("\n\\newpage\n")
-    }
-  }
 }
 ```
 
