@@ -30,8 +30,8 @@
 INPUT_DIR    <- "data_raw"   # Folder containing plate CSV files.
 FILE_PATTERN <- "\\.csv$"    # Regex: which files in INPUT_DIR to include.
 FILES        <- NULL         # Optional: explicit character vector of file paths.
-                             # If set, INPUT_DIR and FILE_PATTERN are ignored.
-                             # e.g. FILES <- c("data_raw/plate1.csv", "data_raw/plate2.csv")
+# If set, INPUT_DIR and FILE_PATTERN are ignored.
+# e.g. FILES <- c("data_raw/plate1.csv", "data_raw/plate2.csv")
 
 # --- Output ---
 OUTPUT_DIR   <- "outputs"                  # Folder for cleaned CSVs.
@@ -40,7 +40,7 @@ VAR_LOG_PATH <- "audit/pcr_variables.csv"  # Audit log: parameters used per run.
 
 # --- QC Thresholds ---
 DELTA_CQ_THRESHOLD <- 1.0  # Max acceptable |Cq replicate difference|.
-                            # Pairs exceeding this are flagged for review.
+# Pairs exceeding this are flagged for review.
 
 # --- Optional: Remove rows whose sample/content values match a pattern ---
 # Any row where a value in RM_COLUMNS matches any pattern in RM_PATTERNS
@@ -126,6 +126,51 @@ clean_col_names <- function(df) {
   df
 }
 
+# Wrapper around write_csv() with automatic retry on failure.
+#
+# Network-attached storage (e.g. mapped drives, SMB shares) can
+# intermittently refuse a write due to locking or connectivity
+# blips. This wrapper catches those errors, waits a short interval,
+# and retries up to `max_tries` times before giving up.
+#
+# Args:
+#   x         : data frame to write
+#   file      : destination path
+#   append    : passed through to write_csv (default FALSE)
+#   max_tries : maximum number of attempts (default 5)
+#   wait_secs : seconds to wait between attempts (default 3)
+#   ...       : any other arguments passed through to write_csv
+write_csv_retry <- function(x, file, append = FALSE,
+                            max_tries = 5, wait_secs = 3, ...) {
+  attempt <- 0
+  repeat {
+    attempt <- attempt + 1
+    result  <- tryCatch(
+      {
+        write_csv(x, file, append = append, ...)
+        "ok"
+      },
+      error = function(e) e
+    )
+
+    if (identical(result, "ok")) break
+
+    if (attempt >= max_tries) {
+      stop(sprintf(
+        "write_csv_retry: failed after %d attempt(s) writing to:\n  %s\nLast error: %s",
+        attempt, file, conditionMessage(result)
+      ))
+    }
+
+    cat(sprintf(
+      "  [write retry %d/%d] Could not write to '%s'. Waiting %ds...\n",
+      attempt, max_tries, basename(file), wait_secs
+    ))
+    Sys.sleep(wait_secs)
+  }
+  invisible(x)
+}
+
 
 # ============================================================
 # SECTION 5: Progress Reporting Helpers
@@ -163,15 +208,15 @@ pg_info <- function(label, detail) {
 
 # Print the "starting step X" line.
 pg_step_start <- function(step_num, step_name) {
-  cat(sprintf("\u25B6 Step %d \u2502 %s ...\n", step_num, step_name))
+  cat(sprintf("> Step %d \u2502 %s ...\n", step_num, step_name))
 }
 
 # Print the "step X done" line with an optional result summary.
 pg_step_done <- function(step_num, detail = NULL) {
   if (is.null(detail)) {
-    cat(sprintf("   Step %d \u2502 done\n", step_num))
+    cat(sprintf("  Step %d \u2502 done\n", step_num))
   } else {
-    cat(sprintf("   Step %d \u2502 done \u2502 %s\n", step_num, detail))
+    cat(sprintf("  Step %d \u2502 done \u2502 %s\n", step_num, detail))
   }
 }
 
@@ -206,7 +251,7 @@ pg_summary <- function(n_out, n_review) {
 ensure_dec_log <- function(path) {
   if (!dir.exists(dirname(path))) dir.create(dirname(path), recursive = TRUE)
   if (!file.exists(path)) {
-    write_csv(
+    write_csv_retry(
       tibble(
         timestamp  = as_datetime(character()),
         user       = character(),
@@ -249,9 +294,10 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
     rule_id    = rule_id,
     outcome    = outcome,
     evidence   = evidence,
-    source     = "R_script"
+    source     = "R_script",
+    version    = "0.1.0"
   )
-  write_csv(entry, dec_log_path, append = TRUE)
+  write_csv_retry(entry, dec_log_path, append = TRUE)
   invisible(entry)
 }
 
@@ -261,7 +307,7 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
 ensure_var_log <- function(path) {
   if (!dir.exists(dirname(path))) dir.create(dirname(path), recursive = TRUE)
   if (!file.exists(path)) {
-    write_csv(
+    write_csv_retry(
       tibble(
         timestamp  = as_datetime(character()),
         user       = character(),
@@ -355,7 +401,7 @@ log_variables <- function(vars, run_id, var_log_path, default_file,
     version    = "0.1.0"
   )
 
-  write_csv(entry, var_log_path, append = TRUE)
+  write_csv_retry(entry, var_log_path, append = TRUE)
   invisible(entry)
 }
 
@@ -776,7 +822,7 @@ process_plate <- function(file,
   dat3 <- dat2 |>
     left_join(
       rep_summary |> select(all_of(rep_key), delta_cq, avg_sq, both_cq_na,
-                              rv_single_rep, rv_delta_cq, rv_mixed_na_num, rv_high_sq),
+                            rv_single_rep, rv_delta_cq, rv_mixed_na_num, rv_high_sq),
       by = rep_key
     ) |>
     mutate(flag_name_mismatch = coalesce(flag_name_mismatch, FALSE))
@@ -884,8 +930,8 @@ process_plate <- function(file,
     filter(needs_review_grp) |>
     select(-needs_review_grp)
 
-  write_csv(all_samples,    all_path)
-  write_csv(review_samples, review_path)
+  write_csv_retry(all_samples,    all_path)
+  write_csv_retry(review_samples, review_path)
 
   pg_step_done(5)
   pg_summary(nrow(all_samples), nrow(review_samples))
@@ -932,7 +978,7 @@ cat(paste(" -", plate_files, collapse = "\n"), "\n")
 # SECTION 9: Run Pipeline Across All Plates
 # ============================================================
 
-results <- lapply(seq_along(plate_files), function(i) {
+results <- lapply(seq_along(plate_files)[1], function(i) {
   process_plate(
     file           = plate_files[[i]],
     LOD_List       = TARGET_LOD,           # Remove this line and set LOD_Lo / LOD_Hi
