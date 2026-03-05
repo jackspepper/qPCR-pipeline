@@ -295,7 +295,7 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
     outcome    = outcome,
     evidence   = evidence,
     source     = "R_script",
-    version    = "0.1.0"
+    version    = "0.1.2"
   )
   write_csv_retry(entry, dec_log_path, append = TRUE)
   invisible(entry)
@@ -930,8 +930,8 @@ process_plate <- function(file,
     filter(needs_review_grp) |>
     select(-needs_review_grp)
 
-  write_csv_retry(all_samples,    all_path)
-  write_csv_retry(review_samples, review_path)
+  write_csv_retry(all_samples,    all_path,    na = "")
+  write_csv_retry(review_samples, review_path, na = "")
 
   pg_step_done(5)
   pg_summary(nrow(all_samples), nrow(review_samples))
@@ -978,7 +978,7 @@ cat(paste(" -", plate_files, collapse = "\n"), "\n")
 # SECTION 9: Run Pipeline Across All Plates
 # ============================================================
 
-results <- lapply(seq_along(plate_files)[1], function(i) {
+results <- lapply(seq_along(plate_files), function(i) {
   process_plate(
     file           = plate_files[[i]],
     LOD_List       = TARGET_LOD,           # Remove this line and set LOD_Lo / LOD_Hi
