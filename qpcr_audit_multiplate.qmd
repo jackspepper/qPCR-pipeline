@@ -17,15 +17,14 @@ params:
 
   # --- OUTPUTS ---
   output_dir: "outputs"
-  log_path: "audit/pcr_decisions.csv"
+  dec_log_path: "audit/pcr_decisions.csv"
+  var_log_path: "audit/pcr_variables.csv"
 
   # --- QC THRESHOLDS ---
-  LOD_Lo: 0.012
-  LOD_Hi: 2000
   delta_cq_threshold: 1.0
 
   # --- OPTIONAL REMOVAL BY PATTERN ---
-  rm_pattern: ["OM"]        # e.g., ["OM", "^CTRL", "_test$"]
+  rm_pattern: ["OM", "Std", "NTC", "Neg"]        # e.g., ["OM", "^CTRL", "_test$"]
   rm_columns: ["sample"]    # e.g., ["sample","content"]
   enable_preview: false     # show preview tables for regex removal
   dry_run: false            # do NOT remove rows; only preview/log summary
@@ -66,10 +65,39 @@ library(gt)
 library(knitr)
 ```
 
+### LOD Limits Per Target
+
+```{r}
+Target_LOD <- list(
+  LOD_Hi = list(
+    "fucp"      = 2000,
+    "hpd3"      = 2000,
+    "lyta"      = 2000,
+    "copb"      = 2000,
+    "speb"      = 2000,
+    "nuc"       = 2000,
+    "gyrb"      = 2000,
+    "uni"       = 200,
+    "universal" = 200
+    ),
+  LOD_Lo = list(
+    "fucp"      = 0.012,
+    "hpd3"      = 0.012,
+    "lyta"      = 0.012,
+    "copb"      = 0.012,
+    "speb"      = 0.012,
+    "nuc"       = 0.012,
+    "gyrb"      = 0.012,
+    "uni"       = 0.0012,
+    "universal" = 0.0012
+    )
+  )
+```
+
 ### Helpers: logging (includes per-plate input file), reading, and processing
 
 ```{r}
-# ---- Logging helpers ----
+# ---- Decision Logging helpers ----
 ensure_log_store <- function(path) {
   if (!dir.exists(dirname(path))) dir.create(dirname(path), recursive = TRUE)
   if (!file.exists(path)) {
@@ -99,8 +127,8 @@ ensure_log_store <- function(path) {
 }
 
 log_decision <- function(sample_id, target, rule_id, outcome, evidence,
-                         run_id, log_path, default_file) {
-  ensure_log_store(log_path)
+                         run_id, dec_log_path, default_file) {
+  ensure_log_store(dec_log_path)
   entry <- tibble(
     timestamp  = now(tzone = "UTC"),
     user       = Sys.info()[["user"]],
@@ -113,16 +141,161 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
     evidence   = evidence,
     source     = "quarto"
   )
-  write_csv(entry, log_path, append = TRUE)
+  write_csv(entry, dec_log_path, append = TRUE)
   invisible(entry)
+}
+
+# ---- Variable Logging Helpers ----
+
+# Create the store (separate file recommended, but can reuse the same path if you prefer)
+ensure_varlog_store <- function(path) {
+  if (!dir.exists(dirname(path))) dir.create(dirname(path), recursive = TRUE)
+  if (!file.exists(path)) {
+    readr::write_csv(
+      tibble::tibble(
+        timestamp  = lubridate::as_datetime(character()),
+        user       = Sys.info()[["user"]],
+        run_id     = character(),
+        input_file = character(),
+        sample_id  = character(),
+        target     = character(),
+        var_name   = character(),
+        var_value  = character(),
+        var_class  = character(),
+        source     = "quarto"
+      ),
+      path
+    )
+  }
+  invisible(path)
+}
+
+# Reuse your resolver to keep input_file consistent with your pipeline
+.resolve_input_file <- function(default_file) {
+  val <- get0(".current_input_file", envir = .GlobalEnv, inherits = FALSE)
+  if (is.null(val)) basename(default_file) else basename(val)
+}
+
+# Internal: robust serializer with jsonlite if available; safe fallback otherwise
+.serialize_value <- function(x, max_chars = 4000) {
+  # Capture class for logging
+  cls <- paste(class(x), collapse = "/")
+
+  # Try jsonlite if available (more compact & structured)
+  if (requireNamespace("jsonlite", quietly = TRUE)) {
+    val <- tryCatch(
+      jsonlite::toJSON(x, auto_unbox = TRUE, null = "null", na = "string"),
+      error = function(e) NA_character_
+    )
+    if (!is.na(val)) {
+      # json can be long; truncate to keep rows manageable
+      val_chr <- as.character(val)
+      if (nchar(val_chr) > max_chars) {
+        val_chr <- paste0(substr(val_chr, 1, max_chars), "... <truncated>")
+      }
+      return(list(value = val_chr, class = cls))
+    }
+  }
+
+  # Fallbacks for common types
+  val_chr <- tryCatch({
+    if (is.atomic(x)) {
+      # Vectors: collapse with comma; show NAs
+      paste0(
+        sprintf("%s", x),
+        collapse = ", "
+      )
+    } else if (is.data.frame(x)) {
+      # Show a compact preview (first few rows/cols)
+      prev <- utils::capture.output(utils::head(x, 5))
+      paste(prev, collapse = "\n")
+    } else if (is.list(x)) {
+      # Named list preview
+      nm <- names(x) %||% seq_along(x)
+      items <- paste0(nm, "=", vapply(x, function(e) {
+        ce <- tryCatch(as.character(e), error = function(e) "<non-coercible>")
+        paste(utils::head(ce, 3), collapse = "|")
+      }, character(1)))
+      paste(items, collapse = ", ")
+    } else {
+      # Generic deparse
+      paste(utils::capture.output(str(x, max.level = 1)), collapse = "\n")
+    }
+  }, error = function(e) "<unserializable>")
+
+  if (nchar(val_chr) > max_chars) {
+    val_chr <- paste0(substr(val_chr, 1, max_chars), "... <truncated>")
+  }
+  list(value = val_chr, class = cls)
+}
+
+# Main: log a set of variables used for a decision/run
+# - vars: named list or named atomic vector, e.g. list(threshold=0.05, retries=3, flags=c("A","B"))
+# - sample_id/target can be NULL; they’ll be stored as NA
+log_variables <- function(vars,
+                          run_id,
+                          var_log_path,
+                          default_file,
+                          sample_id = NULL,
+                          target = NULL) {
+  # Defensive checks
+  if (is.null(vars) || length(vars) == 0) {
+    return(invisible(tibble::tibble()))
+  }
+  if (is.null(names(vars)) || any(is.na(names(vars)) | names(vars) == "")) {
+    stop("`vars` must be a named list or named vector with non-empty names.")
+  }
+
+  ensure_varlog_store(var_log_path)
+
+  # Build entries (one row per variable)
+  ser <- lapply(vars, .serialize_value)
+  var_names  <- names(vars)
+  var_values <- vapply(ser, function(s) s$value, character(1))
+  var_class  <- vapply(ser, function(s) s$class, character(1))
+
+  entry <- tibble::tibble(
+    timestamp  = lubridate::now(tzone = "UTC"),
+    user       = Sys.info()[["user"]],
+    run_id     = run_id,
+    input_file = .resolve_input_file(default_file),
+    sample_id  = as.character(sample_id %||% NA_character_),
+    target     = as.character(target %||% NA_character_),
+    var_name   = var_names,
+    var_value  = var_values,
+    var_class  = var_class,
+    source     = "quarto"
+  )
+
+  readr::write_csv(entry, var_log_path, append = TRUE)
+  invisible(entry)
+}
+
+# Convenience: If you want to log selected columns from a data frame row (e.g., your analysis parameters),
+# this helper converts them into a named list first.
+log_variables_from_df <- function(df, cols, run_id, var_log_path, default_file, sample_id = NULL, target = NULL) {
+  stopifnot(is.data.frame(df))
+  stopifnot(all(cols %in% names(df)))
+  if (nrow(df) != 1) stop("`df` should contain exactly one row for logging.")
+
+  vars <- as.list(df[1, cols, drop = FALSE])
+  names(vars) <- cols
+  log_variables(
+    vars = vars,
+    run_id = run_id,
+    log_path = var_log_path,
+    default_file = default_file,
+    sample_id = sample_id,
+    target = target
+  )
 }
 
 # ---- Core processing for a single plate file ----
 process_plate <- function(file,
-                          LOD_Lo, LOD_Hi, dCq_thr,
+                          LOD_Lo = NULL, LOD_Hi = NULL, LOD_List = NULL, dCq_thr,
                           rm_patterns, rm_cols_req,
                           enable_preview, dry_run, debug_print,
-                          output_dir, log_path) {
+                          output_dir, dec_log_path, var_log_path) {
   assign(".current_input_file", file, envir = .GlobalEnv)
 
   stem   <- tools::file_path_sans_ext(basename(file))
@@ -153,6 +326,73 @@ process_plate <- function(file,
     print(head(dat))
   }
   
+  # Step -1: LOD Determination
+  
+  if(is.null(LOD_List) & is.null(LOD_Lo) & is.null(LOD_Hi)) {stop("No rigid LOD (`LOD_Lo` & `LOD_Hi`) or dynamic per-target LOD (`LOD_List`) has been set")} 
+  
+  if(!is.null(LOD_List)) {
+    
+   # Collect target names from data (normalize for matching)
+   targets <- dat %>%
+       dplyr::pull(target) %>%
+       unique() %>%
+       as.character() %>%
+       trimws() %>%
+       tolower()
+   
+   if (anyNA(targets)) {
+       stop(sprintf("NA present in `targets` in dataset %s. Please correct raw data file.", file))
+   }
+   
+   # Ensure definitions exist for all targets
+   missing_hi <- setdiff(targets, names(LOD_List$LOD_Hi))
+   missing_lo <- setdiff(targets, names(LOD_List$LOD_Lo))
+   if (length(missing_hi)) stop("Missing targets in LOD_Hi: ", paste(missing_hi, collapse = ", "))
+   if (length(missing_lo)) stop("Missing targets in LOD_Lo: ", paste(missing_lo, collapse = ", "))
+   
+   # Pull aligned vectors
+   hi_vals <- as.numeric(LOD_List$LOD_Hi[targets])
+   lo_vals <- as.numeric(LOD_List$LOD_Lo[targets])
+   
+   # Quick strict check: all equal across targets
+   all_hi_equal <- length(unique(hi_vals)) == 1
+   all_lo_equal <- length(unique(lo_vals)) == 1
+   
+   # If numeric and you want tolerance (recommended)
+   tol <- 1e-9
+   all_hi_equal_tol <- max(hi_vals) - min(hi_vals) <= tol
+   all_lo_equal_tol <- max(lo_vals) - min(lo_vals) <= tol
+   
+   # Report
+   message("All Hi equal (strict): ", all_hi_equal)
+   message("All Lo equal (strict): ", all_lo_equal)
+   message("All Hi equal (tol=", tol, "): ", all_hi_equal_tol)
+   message("All Lo equal (tol=", tol, "): ", all_lo_equal_tol)
+   
+   # If you want a detailed table of unique values per group:
+   summary_tbl <- tibble(
+       target = targets,
+       LOD_Hi = hi_vals,
+       LOD_Lo = lo_vals
+   )
+   
+   LOD_Hi <- sort(unique(hi_vals))
+   LOD_Lo <- sort(unique(lo_vals))
+   
+   if (!all_hi_equal_tol) {
+       # Which targets differ by Hi groups
+       print(summary_tbl %>% arrange(LOD_Hi))
+       stop("Raw data subsetting required. Different Hi values found: ", paste(hi_levels, collapse = ", "))
+   }
+   
+   if (!all_lo_equal_tol) {
+     # Which targets differ by Lo groups
+     print(summary_tbl %>% arrange(LOD_Lo))
+     mes
+     stop("Raw data subsetting required. Different Lo values found: ", paste(lo_levels, collapse = ", "))
+     }
+  }
+  
   # Step 0: Removal of unnamed samples
   dat <- dat %>%
     mutate(
@@ -167,7 +407,7 @@ process_plate <- function(file,
     do({
       log_decision(.$sample, .$target, .$sample_reason, "applied",
                    paste0("Removed due to absent sample name"),
-                   run_id, log_path, file)
+                   run_id, dec_log_path, file)
       tibble(.)
     }) %>% invisible()
   
@@ -197,7 +437,7 @@ process_plate <- function(file,
     do({
       log_decision(.$sample, .$target, .$sq_adj_reason, "applied",
                    paste0("sq_raw=", .$sq_raw, "; LOD_Lo=", LOD_Lo),
-                   run_id, log_path, file)
+                   run_id, dec_log_path, file)
       tibble(.)
     }) %>% invisible()
   
@@ -235,7 +475,7 @@ process_plate <- function(file,
         log_decision(NA, NA, "RM_PATTERN", "preview",
                      paste0("patterns=", combined_pat, "; cols=", paste(rm_cols, collapse=","),
                             "; n_matches=", rm_preview_counts$n_matches),
-                     run_id, log_path, file)
+                     run_id, dec_log_path, file)
       }
 
       if (isTRUE(dry_run)) {
@@ -243,13 +483,13 @@ process_plate <- function(file,
         log_decision(NA, NA, "RM_PATTERN", "dry_run",
                      paste0("patterns=", combined_pat, "; cols=", paste(rm_cols, collapse=","),
                             "; n_matches=", n_hits),
-                     run_id, log_path, file)
+                     run_id, dec_log_path, file)
         dat1 <- dat1 %>% select(-rm_hit)
       } else {
         dat1 %>% filter(rm_hit) %>% rowwise() %>% do({
           log_decision(.$sample, .$target, "RM_PATTERN", "applied",
                        paste0("cols=", paste(rm_cols, collapse=","), "; pattern=", combined_pat),
-                       run_id, log_path, file)
+                       run_id, dec_log_path, file)
           tibble(.)
         }) %>% invisible()
         dat1 <- dat1 %>% filter(!rm_hit) %>% select(-rm_hit)
@@ -272,7 +512,7 @@ process_plate <- function(file,
   name_checks %>% filter(flag_name_mismatch) %>% rowwise() %>% do({
     log_decision(NA, .$target, "QC_SN_MISMATCH", "applied",
                  paste0("content=", .$content, "; samples=", .$samples),
-                 run_id, log_path, file)
+                 run_id, dec_log_path, file)
     tibble(.)
   }) %>% invisible()
 
@@ -318,41 +558,41 @@ process_plate <- function(file,
   rep_summary %>% rowwise() %>% do({
     if (.$rv_single_rep)
       log_decision(.$sample, .$target, "RV_SINGLE_REP", "applied",
-                   paste0("n_rows=", .$n_rows), run_id, log_path, file)
+                   paste0("n_rows=", .$n_rows), run_id, dec_log_path, file)
     else
       log_decision(.$sample, .$target, "RV_SINGLE_REP", "skipped",
-                   paste0("n_rows=", .$n_rows), run_id, log_path, file)
+                   paste0("n_rows=", .$n_rows), run_id, dec_log_path, file)
 
     if (!is.na(.$delta_cq) && (.$delta_cq > dCq_thr) && (.$avg_sq > LOD_Lo))
       log_decision(.$sample, .$target, "RV_DELTA_CQ", "applied",
                    paste0("|DeltaCq|=", .$delta_cq, "; thr=", dCq_thr,
                           "; avg_sq=", .$avg_sq, "; LOD_Lo=", LOD_Lo),
-                   run_id, log_path, file)
+                   run_id, dec_log_path, file)
     else
       log_decision(.$sample, .$target, "RV_DELTA_CQ", "skipped",
                    paste0("|DeltaCq|=", .$delta_cq, "; thr=", dCq_thr,
                           "; avg_sq=", .$avg_sq),
-                   run_id, log_path, file)
+                   run_id, dec_log_path, file)
 
     if (.$rv_mixed_na_num)
       log_decision(.$sample, .$target, "RV_MIXED_CQ", "applied",
                    paste0("n_num_cq=", .$n_num_cq, "; n_rows=", .$n_rows),
-                   run_id, log_path, file)
+                   run_id, dec_log_path, file)
     else
       log_decision(.$sample, .$target, "RV_MIXED_CQ", "skipped",
-                   paste0("n_num_cq=", .$n_num_cq), run_id, log_path, file)
+                   paste0("n_num_cq=", .$n_num_cq), run_id, dec_log_path, file)
 
     if (.$pass_negative)
       log_decision(.$sample, .$target, "PASS_NEGATIVE", "pass",
-                   "both Cq are NA/NaN", run_id, log_path, file)
+                   "both Cq are NA/NaN", run_id, dec_log_path, file)
 
     if (.$rv_high_sq)
       log_decision(.$sample, .$target, "RV_HIGH_SQ", "applied",
                    paste0("avg_sq=", .$avg_sq, "; LOD_Hi=", LOD_Hi),
-                   run_id, log_path, file)
+                   run_id, dec_log_path, file)
     else
       log_decision(.$sample, .$target, "RV_HIGH_SQ", "skipped",
-                   paste0("avg_sq=", .$avg_sq), run_id, log_path, file)
+                   paste0("avg_sq=", .$avg_sq), run_id, dec_log_path, file)
 
     tibble(.)
   }) %>% invisible()
@@ -423,6 +663,33 @@ process_plate <- function(file,
     print(head(dat_out))
   }
 
+  # Logging of final variables used
+  
+  vars_used <- list(
+    file        = file,
+    dCq_thr     = dCq_thr,
+    targets     = targets,
+    lod_hi      = LOD_Hi,
+    lod_lo      = LOD_Lo,
+    rm_patterns = rm_patterns,
+    rm_cols_req = rm_cols_req,
+    enable_preview = enable_preview, 
+    dry_run = dry_run, 
+    debug_print = debug_print,
+    output_dir = output_dir, 
+    dec_log_path = dec_log_path,
+    var_log_path = var_log_path
+    )
+
+  entry_rows <- log_variables(
+    vars         = vars_used,
+    run_id       = run_id,          # or a UUID you’re using elsewhere
+    var_log_path = var_log_path,
+    default_file = "file"
+    )
+  
+  # Writing Data
+  
   dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
   all_path    <- file.path(output_dir, paste0(stem, "_all_samples.csv"))
   review_path <- file.path(output_dir, paste0(stem, "_review_samples.csv"))
@@ -468,6 +735,7 @@ process_plate <- function(file,
     preview_enabled = isTRUE(enable_preview),
     dry_run = isTRUE(dry_run)
   )
+  
 }
 ```
 
@@ -540,12 +808,11 @@ for (i in seq_along(plate_files)) {
   stem <- tools::file_path_sans_ext(basename(f))
 
   res <- process_plate(
-    file = f,
-    LOD_Lo = params$LOD_Lo, LOD_Hi = params$LOD_Hi, dCq_thr = params$delta_cq_threshold,
+    file = f, dCq_thr = params$delta_cq_threshold, LOD_List = Target_LOD,
     rm_patterns = params$rm_pattern, rm_cols_req = params$rm_columns,
     enable_preview = params$enable_preview, dry_run = params$dry_run,
     debug_print = params$debug_print, output_dir = params$output_dir,
-    log_path = params$log_path
+    dec_log_path = params$dec_log_path, var_log_path = params$var_log_path
   )
   # Keep the file path for the table
   res$file <- f
@@ -566,8 +833,9 @@ for (i in seq_along(plate_files)) {
 ## Appendix — Latest audit entries & counts (all plates in this run)
 
 ```{r}
-audit <- read_csv(params$log_path, show_col_types = FALSE)
+audit <- read_csv(params$dec_log_path, show_col_types = FALSE)
 audit %>% arrange(desc(timestamp)) %>% head(30)
 
 audit %>% count(input_file, rule_id, outcome, sort = TRUE)
+rm(audit)
 ```
