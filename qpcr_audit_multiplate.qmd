@@ -261,7 +261,8 @@ log_variables <- function(vars,
     var_name   = var_names,
     var_value  = var_values,
     var_class  = var_class,
-    source     = "quarto"
+    source     = "quarto",
+    versionse  = "0.1.0"
   )
 
   readr::write_csv(entry, var_log_path, append = TRUE)
