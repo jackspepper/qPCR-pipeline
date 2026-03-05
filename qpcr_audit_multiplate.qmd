@@ -549,7 +549,7 @@ process_plate <- function(file,
     ) %>%
     mutate(
       rv_single_rep   = single_rep,
-      rv_delta_cq     = !is.na(delta_cq) & (delta_cq > dCq_thr) & (avg_sq > LOD_Lo),
+      rv_delta_cq     = !is.na(delta_cq) & (delta_cq > dCq_thr),
       rv_mixed_na_num = one_cq_na,
       pass_negative   = both_cq_na,
       rv_high_sq      = avg_sq > LOD_Hi
@@ -563,15 +563,13 @@ process_plate <- function(file,
       log_decision(.$sample, .$target, "RV_SINGLE_REP", "skipped",
                    paste0("n_rows=", .$n_rows), run_id, dec_log_path, file)
 
-    if (!is.na(.$delta_cq) && (.$delta_cq > dCq_thr) && (.$avg_sq > LOD_Lo))
+    if (!is.na(.$delta_cq) && (.$delta_cq > dCq_thr))
       log_decision(.$sample, .$target, "RV_DELTA_CQ", "applied",
-                   paste0("|DeltaCq|=", .$delta_cq, "; thr=", dCq_thr,
-                          "; avg_sq=", .$avg_sq, "; LOD_Lo=", LOD_Lo),
+                   paste0("|DeltaCq|=", .$delta_cq, "; thr=", dCq_thr),
                    run_id, dec_log_path, file)
     else
       log_decision(.$sample, .$target, "RV_DELTA_CQ", "skipped",
-                   paste0("|DeltaCq|=", .$delta_cq, "; thr=", dCq_thr,
-                          "; avg_sq=", .$avg_sq),
+                   paste0("|DeltaCq|=", .$delta_cq, "; thr=", dCq_thr),
                    run_id, dec_log_path, file)
 
     if (.$rv_mixed_na_num)
@@ -614,7 +612,7 @@ process_plate <- function(file,
       ~flag,               ~reason,
     "flag_name_mismatch","Sample name mismatch within (Fluor, Target, Content)",
     "rv_single_rep",     "Only one replicate present",
-    "rv_delta_cq",       "|DeltaCq| greater than threshold AND AverageSQ > LOD_Lo",
+    "rv_delta_cq",       "|DeltaCq| greater than threshold regardless of SQ",
     "rv_mixed_na_num",   "One Cq is NA/NaN and the other numeric",
     "rv_high_sq",        "AverageSQ > LOD_Hi"
   )
