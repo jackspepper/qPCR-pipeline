@@ -205,15 +205,14 @@ check_plate_complete <- function(stem, output_dir) {
 #
 # Args:
 #   skippable : character vector of plate stems that are complete
-#   all_files : character vector of all plate stems avalible to be processed
 #
 # Returns: "Y" or "N" (always uppercase)
-ask_skip_confirmed <- function(skippable, all_files) {
+ask_skip_confirmed <- function(skippable, stems) {
   cat(sprintf(
     "\n%s\n The following %d of %d plate(s) already have both output CSVs:\n%s\n",
     strrep("-", .pg_width),
     length(skippable),
-    length(all_files),
+    length(stems),
     paste(sprintf("   - %s", skippable), collapse = "\n")
   ))
   cat(strrep("-", .pg_width), "\n")
@@ -362,7 +361,7 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
     outcome    = outcome,
     evidence   = evidence,
     source     = "R_script",
-    version    = "0.1.4"
+    version    = "0.1.5"
   )
   write_csv_retry(entry, dec_log_path, append = TRUE)
   invisible(entry)
@@ -830,17 +829,27 @@ process_plate <- function(file,
       both_cq_na  = (n_num_cq == 0),               # Both replicates NA → true negative
       one_cq_na   = (n_num_cq == 1 & n_rows >= 2),  # Only one replicate amplified
       single_rep  = (n_rows == 1),                   # No replication at all
+      excess_reps = (n_rows > 2),                    # More than 2 replicates present
 
-      # Review flags — any TRUE causes the group to appear in the review CSV
-      rv_single_rep   = single_rep,
+      # For >2 replicate groups, skip all computation — the user must reconcile
+      # manually. Both delta_cq and avg_sq are forced to NA so no summary values
+      # appear in the output, making it obvious that review is required.
+      delta_cq = if_else(excess_reps, NA_real_, delta_cq),
+      avg_sq   = if_else(excess_reps, NA_real_, avg_sq),
+
+      # Review flags — any TRUE causes the group to appear in the review CSV.
+      # rv_excess_reps overrides all other flags in review_reason (Step 5).
+      rv_excess_reps  = excess_reps,
+      rv_single_rep   = single_rep   & !excess_reps,
       rv_delta_cq     = !is.na(delta_cq) & (delta_cq > dCq_thr),
-      rv_mixed_na_num = one_cq_na,
+      rv_mixed_na_num = one_cq_na    & !excess_reps,
       rv_high_sq      = avg_sq > LOD_Hi,
       pass_negative   = both_cq_na   # Clean negative; not a failure
     )
 
   n_flagged <- rep_summary |>
-    summarise(n = sum(rv_single_rep | rv_delta_cq | rv_mixed_na_num | rv_high_sq,
+    summarise(n = sum(rv_excess_reps | rv_single_rep | rv_delta_cq |
+                        rv_mixed_na_num | rv_high_sq,
                       na.rm = TRUE)) |>
     pull(n)
 
@@ -848,6 +857,11 @@ process_plate <- function(file,
   rep_summary |>
     rowwise() |>
     do({
+      log_decision(.$sample, .$target, "RV_EXCESS_REPS",
+                   if (.$rv_excess_reps) "applied" else "skipped",
+                   paste0("n_rows=", .$n_rows, "; threshold=2"),
+                   run_id, dec_log_path, file)
+
       log_decision(.$sample, .$target, "RV_SINGLE_REP",
                    if (.$rv_single_rep) "applied" else "skipped",
                    paste0("n_rows=", .$n_rows), run_id, dec_log_path, file)
@@ -890,14 +904,17 @@ process_plate <- function(file,
   dat3 <- dat2 |>
     left_join(
       rep_summary |> select(all_of(rep_key), delta_cq, avg_sq, both_cq_na,
-                            rv_single_rep, rv_delta_cq, rv_mixed_na_num, rv_high_sq),
+                            rv_excess_reps, rv_single_rep, rv_delta_cq,
+                            rv_mixed_na_num, rv_high_sq),
       by = rep_key
     ) |>
     mutate(flag_name_mismatch = coalesce(flag_name_mismatch, FALSE))
 
-  # Human-readable descriptions mapped to each flag column
+  # Human-readable descriptions mapped to each flag column.
+  # rv_excess_reps is listed first so it is easy to spot in the override logic below.
   reason_map <- tribble(
     ~flag,                ~reason,
+    "rv_excess_reps",     "More than 2 replicates — manual reconciliation required",
     "flag_name_mismatch", "Sample name mismatch within (Fluor, Target, Content)",
     "rv_single_rep",      "Only one replicate present",
     "rv_delta_cq",        "|DeltaCq| exceeds threshold",
@@ -905,8 +922,8 @@ process_plate <- function(file,
     "rv_high_sq",         "AverageSQ > LOD_Hi"
   )
 
-  review_cols <- c("flag_name_mismatch", "rv_single_rep", "rv_delta_cq",
-                   "rv_mixed_na_num", "rv_high_sq")
+  review_cols <- c("rv_excess_reps", "flag_name_mismatch", "rv_single_rep",
+                   "rv_delta_cq", "rv_mixed_na_num", "rv_high_sq")
 
   dat3 <- dat3 |>
     mutate(
@@ -914,8 +931,17 @@ process_plate <- function(file,
       review_reason = pmap_chr(
         pick(all_of(review_cols)),
         function(...) {
-          flags_logical <- c(...)
-          flags         <- review_cols[flags_logical]
+          flags_logical        <- c(...)
+          names(flags_logical) <- review_cols
+
+          # rv_excess_reps overrides all other flags: Cq and SQ are blanked for
+          # these groups so there is nothing meaningful for the other checks to
+          # act on. Only the excess-reps reason is shown.
+          if (isTRUE(flags_logical[["rv_excess_reps"]])) {
+            return(reason_map$reason[reason_map$flag == "rv_excess_reps"])
+          }
+
+          flags <- review_cols[flags_logical]
           if (length(flags) == 0) return(NA_character_)
           paste(reason_map$reason[match(flags, reason_map$flag)], collapse = " ; ")
         }
@@ -983,8 +1009,10 @@ process_plate <- function(file,
       Target                   = target,
       Content                  = content,
       Sample                   = sample,
-      Cq                       = cq,
-      `Starting Quantity (SQ)` = sq_adj,
+      # For >2 replicate groups, Cq and SQ are blanked on every row so the
+      # user cannot accidentally use unchecked values downstream.
+      Cq                       = if_else(rv_excess_reps, NA_character_, cq),
+      `Starting Quantity (SQ)` = if_else(rv_excess_reps, NA_real_,      sq_adj),
       DeltaCq                  = out_delta_cq,
       AverageSQ                = out_average_sq,
       review_reason            = out_reason
@@ -1110,27 +1138,24 @@ if (isTRUE(SKIP_COMPLETED)) {
     if (skip_response == "Y") {
       skipped_plates <- skippable
       plate_files    <- plate_files[!completed]
-      cat(sprintf("\n  Skipping %d plate(s); %d file(s) remaining to process.\n\n",
+      cat(sprintf("\n  Skipping %d plate(s); %d remaining to process.\n\n",
                   length(skipped_plates), length(plate_files)))
     } else {
-      cat(sprintf("\n  Reprocessing all plates; %d file(s) to process.\n\n",
-                  length(plate_files)))
+      cat("\n  Reprocessing all plates.\n\n")
     }
 
   } else {
-    cat(sprintf("  No completed plates found — all %d file(s) will be processed.\n",
-                length(plate_files)))
+    cat("  No completed plates found — all plates will be processed.\n")
   }
 } else {
-  cat(sprintf("  SKIP_COMPLETED is FALSE — processing all %d discovered file(s).\n",
-              length(plate_files)))
+  cat("  SKIP_COMPLETED is FALSE — processing all discovered plates.\n")
 }
 
 # After skipping, check there is still something left to do
 if (length(plate_files) == 0) {
-  cat("\n  0 file(s) remaining to process — nothing to do.\n")
-  cat("  To reprocess completed plates, set SKIP_COMPLETED <- FALSE.\n")
-  stop("No plates remaining after skip check.", call. = FALSE)
+  cat("\n  All discovered plates were skipped. Nothing to process.\n")
+  stop("No plates remaining after skip check. ",
+       "Set SKIP_COMPLETED <- FALSE to reprocess all.", call. = FALSE)
 }
 
 
