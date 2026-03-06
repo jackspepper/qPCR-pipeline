@@ -27,26 +27,11 @@
 # to edit anything outside Sections 1 and 2.
 
 # --- Input ---
-INPUT_DIR    <- "."          # Top-level folder to search for plate CSV files.
-# Use `.` OR getwd() to start the search at the current working directory.
-FILE_PATTERN <- "\\.csv$"    # Regex: which files to include (matched against filename).
+INPUT_DIR    <- "data_raw/test/test1/"   # Folder containing plate CSV files.
+FILE_PATTERN <- "\\.csv$"    # Regex: which files in INPUT_DIR to include.
 FILES        <- NULL         # Optional: explicit character vector of file paths.
-# If set, INPUT_DIR, FILE_PATTERN, and SEARCH_DEPTH
-# are all ignored.
+# If set, INPUT_DIR and FILE_PATTERN are ignored.
 # e.g. FILES <- c("data_raw/plate1.csv", "data_raw/plate2.csv")
-
-SEARCH_DEPTH <- 5            # How many subfolder levels to search within INPUT_DIR.
-#   0 = only files directly inside INPUT_DIR
-#   1 = INPUT_DIR + one level of subfolders
-#   2 = INPUT_DIR + two levels of subfolders, etc.
-# Safe to set higher than your actual folder depth —
-# the script will just use whatever levels exist.
-
-# --- File tree ---
-# A tree of all matching files found is produced before processing begins.
-# It shows the folder structure and which files will be processed.
-TREE_OUTPUT  <- "both"       # Where to send the tree: "console", "file", or "both".
-TREE_PATH    <- "audit/file_tree.txt"  # Destination when TREE_OUTPUT is "file" or "both".
 
 # --- Output ---
 OUTPUT_DIR   <- "outputs"                  # Folder for cleaned CSVs.
@@ -71,6 +56,15 @@ DRY_RUN <- FALSE
 
 # Set to TRUE to print intermediate data frames to the console (for debugging).
 DEBUG_PRINT <- FALSE
+
+# --- Resume / skip completed plates ---
+# Set to TRUE to check whether output CSVs already exist for each plate before
+# processing. Plates where both <stem>_all_samples.csv AND
+# <stem>_review_samples.csv already exist in OUTPUT_DIR will be listed and you
+# will be asked whether to skip them (Y) or reprocess them (N).
+# If the script is run non-interactively (e.g. scheduled via Rscript), it
+# defaults to N — reprocess everything — and logs that no prompt was possible.
+SKIP_COMPLETED <- TRUE
 
 
 # ============================================================
@@ -187,140 +181,60 @@ write_csv_retry <- function(x, file, append = FALSE,
 }
 
 
-
-# Depth-aware file discovery.
-#
-# Lists all files matching `pattern` within `dir`, up to `depth` subfolder
-# levels deep. Gracefully handles a requested depth that exceeds the actual
-# folder structure — it simply returns whatever exists without erroring.
+# Checks whether a plate has already been fully processed.
+# A plate is considered complete when BOTH output CSVs exist:
+#   <stem>_all_samples.csv  and  <stem>_review_samples.csv
 #
 # Args:
-#   dir     : root directory to search
-#   pattern : regex matched against filenames (same as FILE_PATTERN)
-#   depth   : max subfolder depth (0 = root only, 1 = root + 1 level, etc.)
+#   stem       : filename stem (no extension) of the plate, e.g. "plate1"
+#   output_dir : OUTPUT_DIR value (where processed CSVs are written)
 #
-# Returns: character vector of full file paths, sorted
-list_files_depth <- function(dir, pattern, depth) {
-  if (!dir.exists(dir)) stop("INPUT_DIR does not exist: ", dir)
-
-  # Depth 0: skip recursion entirely
-  if (depth == 0) {
-    return(sort(list.files(dir, pattern = pattern,
-                           full.names = TRUE, recursive = FALSE)))
-  }
-
-  # Get every matching file recursively, then filter by depth
-  all_files <- list.files(dir, pattern = pattern,
-                          full.names = TRUE, recursive = TRUE)
-  if (length(all_files) == 0) return(character(0))
-
-  # Normalise separators so depth counting works on Windows and Unix
-  norm      <- function(p) gsub("\\\\", "/", p)
-  root      <- norm(dir)
-  if (!endsWith(root, "/")) root <- paste0(root, "/")
-  root_esc  <- gsub("([.+*?|(){}\\[\\]^$])", "\\\\\\1", root)
-
-  rel_paths  <- sub(paste0("^", root_esc), "", norm(all_files))
-  # Number of "/" in relative path = subfolder depth of the file
-  file_depth <- nchar(gsub("[^/]", "", rel_paths))
-
-  sort(all_files[file_depth <= depth])
+# Returns: TRUE if both files exist, FALSE otherwise
+check_plate_complete <- function(stem, output_dir) {
+  all_path    <- file.path(output_dir, paste0(stem, "_all_samples.csv"))
+  review_path <- file.path(output_dir, paste0(stem, "_review_samples.csv"))
+  file.exists(all_path) && file.exists(review_path)
 }
 
 
-# Build an ASCII file tree of the discovered files.
+# Prompts the user interactively to confirm whether to skip completed plates.
+# Prints a summary table of which plates would be skipped, then waits for Y/N.
 #
-# Shows only the files that will be processed (matching FILE_PATTERN up to
-# SEARCH_DEPTH), grouped by their folder structure.
-#
-# Args:
-#   files           : character vector of full file paths to display
-#   root_dir        : INPUT_DIR (used as the tree root label)
-#   depth_requested : SEARCH_DEPTH value (shown in the header for reference)
-#
-# Returns: character vector — one element per line of the rendered tree
-build_file_tree <- function(files, root_dir, depth_requested) {
-
-  norm     <- function(p) gsub("\\\\", "/", p)
-  root     <- norm(root_dir)
-  if (!endsWith(root, "/")) root <- paste0(root, "/")
-  root_esc <- gsub("([.+*?|(){}\\[\\]^$])", "\\\\\\1", root)
-
-  rel          <- sort(sub(paste0("^", root_esc), "", norm(files)))
-  depth_actual <- if (length(rel) > 0) max(nchar(gsub("[^/]", "", rel))) else 0
-
-  header <- sprintf(
-    "%s  [depth requested: %d | deepest file: %d level(s) | %d file(s) to process]",
-    basename(root_dir), depth_requested, depth_actual, length(files)
-  )
-
-  if (length(files) == 0) {
-    return(c(header, "  (no matching files found)"))
-  }
-
-  # Recursive renderer — takes relative paths and a hanging-indent prefix
-  render_node <- function(paths, prefix) {
-    if (length(paths) == 0) return(character(0))
-
-    # Split each path into its first component (head) and the rest (tail)
-    heads   <- sub("/.*$", "", paths)
-    is_file <- !grepl("/", paths, fixed = TRUE)  # no slash → leaf file at this level
-    tails   <- ifelse(is_file, NA_character_, sub("^[^/]*/", "", paths))
-
-    unique_heads <- unique(heads)
-    lines        <- character(0)
-
-    for (i in seq_along(unique_heads)) {
-      h        <- unique_heads[[i]]
-      is_last  <- (i == length(unique_heads))
-      conn     <- if (is_last) "\u2514\u2500\u2500 " else "\u251c\u2500\u2500 "
-      child_px <- if (is_last) paste0(prefix, "    ") else paste0(prefix, "\u2502   ")
-      idx      <- which(heads == h)
-
-      if (all(is_file[idx])) {
-        # Plain file — just emit the filename
-        lines <- c(lines, paste0(prefix, conn, h))
-      } else {
-        # Directory — emit the folder name then recurse into its children
-        children <- tails[idx]
-        children <- children[!is.na(children)]
-        lines    <- c(lines, paste0(prefix, conn, h, "/"))
-        lines    <- c(lines, render_node(children, child_px))
-      }
-    }
-    lines
-  }
-
-  c(header, render_node(rel, ""))
-}
-
-
-# Print and/or save the file tree.
+# Non-interactive fallback: if stdin is not a terminal (e.g. Rscript in a
+# scheduled job), returns "N" automatically and notes this in the console.
 #
 # Args:
-#   tree_lines  : character vector returned by build_file_tree()
-#   output_mode : "console", "file", or "both"
-#   tree_path   : destination .txt path (used when output_mode is "file" or "both")
-emit_file_tree <- function(tree_lines, output_mode, tree_path) {
-  valid_modes <- c("console", "file", "both")
-  if (!output_mode %in% valid_modes) {
-    stop('TREE_OUTPUT must be one of: "console", "file", or "both". Got: "', output_mode, '"')
+#   skippable : character vector of plate stems that are complete
+#   all_files : character vector of all plate stems avalible to be processed
+#
+# Returns: "Y" or "N" (always uppercase)
+ask_skip_confirmed <- function(skippable, all_files) {
+  cat(sprintf(
+    "\n%s\n The following %d of %d plate(s) already have both output CSVs:\n%s\n",
+    strrep("-", .pg_width),
+    length(skippable),
+    length(all_files),
+    paste(sprintf("   - %s", skippable), collapse = "\n")
+  ))
+  cat(strrep("-", .pg_width), "\n")
+  cat(" Skip these plates and process only the remaining ones?\n")
+  cat(" Enter Y to skip, N to reprocess all: ")
+
+  # Detect non-interactive session (e.g. Rscript, knitr, scheduled jobs)
+  if (!interactive()) {
+    cat("\n  [non-interactive session detected — defaulting to N (reprocess all)]\n")
+    return("N")
   }
 
-  if (output_mode %in% c("console", "both")) {
-    cat(paste(tree_lines, collapse = "\n"), "\n\n")
+  response <- toupper(trimws(readline()))
+
+  # Keep asking until a valid answer is given
+  while (!response %in% c("Y", "N")) {
+    cat("  Please enter Y or N: ")
+    response <- toupper(trimws(readline()))
   }
 
-  if (output_mode %in% c("file", "both")) {
-    if (!dir.exists(dirname(tree_path))) {
-      dir.create(dirname(tree_path), recursive = TRUE, showWarnings = FALSE)
-    }
-    writeLines(
-      c(paste("Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S")), "", tree_lines),
-      tree_path
-    )
-    cat("  File tree saved to:", tree_path, "\n\n")
-  }
+  response
 }
 
 
@@ -414,7 +328,8 @@ ensure_dec_log <- function(path) {
         rule_id    = character(),
         outcome    = character(),
         evidence   = character(),
-        source     = character()
+        source     = character(),
+        version    = character()
       ),
       path
     )
@@ -447,7 +362,7 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
     outcome    = outcome,
     evidence   = evidence,
     source     = "R_script",
-    version    = "0.1.3"
+    version    = "0.1.4"
   )
   write_csv_retry(entry, dec_log_path, append = TRUE)
   invisible(entry)
@@ -470,7 +385,8 @@ ensure_var_log <- function(path) {
         var_name   = character(),
         var_value  = character(),
         var_class  = character(),
-        source     = character()
+        source     = character(),
+        version    = character()
       ),
       path
     )
@@ -1102,28 +1018,21 @@ process_plate <- function(file,
 
 
 # ============================================================
-# SECTION 8: Discover and Validate Plate Files
+# SECTION 8: Discover, Validate, and Filter Plate Files
 # ============================================================
 
 plate_files <- if (!is.null(FILES)) {
-  # Explicit file list supplied — skip directory search entirely
   message("FILES supplied explicitly; ignoring INPUT_DIR, FILE_PATTERN, and SEARCH_DEPTH.")
   as.character(FILES)
 } else {
-  list_files_depth(INPUT_DIR, FILE_PATTERN, SEARCH_DEPTH)
+  list.files(INPUT_DIR, pattern = FILE_PATTERN, full.names = TRUE)
 }
-
-# Build and emit the file tree before any validation, so you can see
-# exactly what was found (or not found) even if something goes wrong below.
-tree_lines <- build_file_tree(plate_files, INPUT_DIR, SEARCH_DEPTH)
-emit_file_tree(tree_lines, TREE_OUTPUT, TREE_PATH)
 
 if (length(plate_files) == 0) {
   stop(
     "No matching files found.\n",
     "  INPUT_DIR    : ", INPUT_DIR,    "\n",
     "  FILE_PATTERN : ", FILE_PATTERN, "\n",
-    "  SEARCH_DEPTH : ", SEARCH_DEPTH, "\n",
     "Check that the folder exists and contains files matching FILE_PATTERN."
   )
 }
@@ -1132,6 +1041,96 @@ missing_files <- plate_files[!file.exists(plate_files)]
 if (length(missing_files) > 0) {
   stop("The following files were found by the search but cannot be accessed:\n",
        paste(" -", missing_files, collapse = "\n"))
+}
+
+cat(sprintf("Found %d file(s) to process:\n", length(plate_files)))
+cat(paste(" -", plate_files, collapse = "\n"), "\n")
+
+# ----------------------------------------------------------
+# Log session-level variables once before the plate loop.
+# These are global settings that do not vary per plate, so
+# they are recorded here with a shared session run_id rather
+# than being passed into process_plate() individually.
+# ----------------------------------------------------------
+.session_run_id <- paste0("SESSION_", format(Sys.time(), "%Y%m%d_%H%M%S"))
+assign(".current_input_file", "(session)", envir = .GlobalEnv)
+
+log_variables(
+  vars = list(
+    INPUT_DIR      = INPUT_DIR,
+    FILE_PATTERN   = FILE_PATTERN,
+    FILES          = if (is.null(FILES)) "(auto-discovered)" else paste(FILES, collapse = "|"),
+    OUTPUT_DIR     = OUTPUT_DIR,
+    DEC_LOG_PATH   = DEC_LOG_PATH,
+    VAR_LOG_PATH   = VAR_LOG_PATH,
+    SKIP_COMPLETED = SKIP_COMPLETED
+  ),
+  run_id       = .session_run_id,
+  var_log_path = VAR_LOG_PATH,
+  default_file = "(session)"
+)
+
+# ----------------------------------------------------------
+# Skip-completed check
+# If SKIP_COMPLETED is TRUE, identify plates where both output
+# CSVs already exist and ask the user whether to skip them.
+# The response is logged in the decision audit log.
+# ----------------------------------------------------------
+skipped_plates  <- character(0)   # stems of plates that were skipped
+skip_response   <- NA_character_  # "Y", "N", or "non-interactive"
+
+if (isTRUE(SKIP_COMPLETED)) {
+
+  stems     <- file_stem(plate_files)
+  completed <- vapply(stems, check_plate_complete, logical(1), output_dir = OUTPUT_DIR)
+
+  if (any(completed)) {
+    skippable    <- stems[completed]
+    skip_response <- ask_skip_confirmed(skippable, stems)
+
+    # Log the Y/N decision (or the non-interactive fallback) for each skippable plate
+    for (s in skippable) {
+      assign(".current_input_file", paste0(s, ".csv"), envir = .GlobalEnv)
+      log_decision(
+        sample_id    = NA,
+        target       = NA,
+        rule_id      = "SKIP_COMPLETED",
+        outcome      = if (skip_response == "Y") "skipped" else "reprocess",
+        evidence     = sprintf(
+          "Both output CSVs found; user response: %s%s",
+          skip_response,
+          if (!interactive()) " (non-interactive default)" else ""
+        ),
+        run_id       = .session_run_id,
+        dec_log_path = DEC_LOG_PATH,
+        default_file = paste0(s, ".csv")
+      )
+    }
+
+    if (skip_response == "Y") {
+      skipped_plates <- skippable
+      plate_files    <- plate_files[!completed]
+      cat(sprintf("\n  Skipping %d plate(s); %d file(s) remaining to process.\n\n",
+                  length(skipped_plates), length(plate_files)))
+    } else {
+      cat(sprintf("\n  Reprocessing all plates; %d file(s) to process.\n\n",
+                  length(plate_files)))
+    }
+
+  } else {
+    cat(sprintf("  No completed plates found — all %d file(s) will be processed.\n",
+                length(plate_files)))
+  }
+} else {
+  cat(sprintf("  SKIP_COMPLETED is FALSE — processing all %d discovered file(s).\n",
+              length(plate_files)))
+}
+
+# After skipping, check there is still something left to do
+if (length(plate_files) == 0) {
+  cat("\n  0 file(s) remaining to process — nothing to do.\n")
+  cat("  To reprocess completed plates, set SKIP_COMPLETED <- FALSE.\n")
+  stop("No plates remaining after skip check.", call. = FALSE)
 }
 
 
@@ -1169,12 +1168,26 @@ cat(strrep("=", .pg_width), "\n", sep = "")
 summary_tbl <- bind_rows(lapply(results, function(r) {
   tibble(
     plate    = r$stem,
+    status   = "processed",
     rows_in  = r$n_in,
     rows_out = r$n_out,
     review   = r$n_review,
     dry_run  = r$dry_run
   )
 }))
+
+# Append skipped plates as their own rows if any were skipped
+if (length(skipped_plates) > 0) {
+  skipped_tbl <- tibble(
+    plate    = skipped_plates,
+    status   = "skipped (outputs already existed)",
+    rows_in  = NA_integer_,
+    rows_out = NA_integer_,
+    review   = NA_integer_,
+    dry_run  = NA
+  )
+  summary_tbl <- bind_rows(summary_tbl, skipped_tbl)
+}
 
 print(summary_tbl)
 
