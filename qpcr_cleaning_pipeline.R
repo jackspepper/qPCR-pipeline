@@ -511,7 +511,7 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
     outcome    = outcome,
     evidence   = evidence,
     source     = "R_script",
-    version    = "0.1.5"
+    version    = "0.1.6"
   )
   write_csv_retry(entry, dec_log_path, append = TRUE)
   invisible(entry)
@@ -993,7 +993,7 @@ process_plate <- function(file,
       rv_single_rep   = single_rep   & !excess_reps,
       rv_delta_cq     = !is.na(delta_cq) & (delta_cq > dCq_thr),
       rv_mixed_na_num = one_cq_na    & !excess_reps,
-      rv_high_sq      = avg_sq > LOD_Hi,
+      rv_high_sq      = !is.na(avg_sq) & (avg_sq > LOD_Hi),
       pass_negative   = both_cq_na   # Clean negative; not a failure
     )
 
