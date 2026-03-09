@@ -28,10 +28,24 @@
 
 # --- Input ---
 INPUT_DIR    <- "data_raw/test/test1/"   # Folder containing plate CSV files.
-FILE_PATTERN <- "\\.csv$"    # Regex: which files in INPUT_DIR to include.
+FILE_PATTERN <- "\\.csv$"    # Regex: which files to include (matched against filename).
 FILES        <- NULL         # Optional: explicit character vector of file paths.
-# If set, INPUT_DIR and FILE_PATTERN are ignored.
+# If set, INPUT_DIR, FILE_PATTERN, and SEARCH_DEPTH
+# are all ignored.
 # e.g. FILES <- c("data_raw/plate1.csv", "data_raw/plate2.csv")
+
+SEARCH_DEPTH <- 0            # How many subfolder levels to search within INPUT_DIR.
+#   0 = only files directly inside INPUT_DIR
+#   1 = INPUT_DIR + one level of subfolders
+#   2 = INPUT_DIR + two levels of subfolders, etc.
+# Safe to set higher than your actual folder depth —
+# the script will just use whatever levels exist.
+
+# --- File tree ---
+# A tree of all matching files found is produced before processing begins.
+# It shows the folder structure and which files will be processed.
+TREE_OUTPUT  <- "both"                 # Where to send the tree: "console", "file", or "both".
+TREE_PATH    <- "audit/file_tree.txt"  # Destination when TREE_OUTPUT is "file" or "both".
 
 # --- Output ---
 OUTPUT_DIR   <- "outputs"                  # Folder for cleaned CSVs.
@@ -178,6 +192,142 @@ write_csv_retry <- function(x, file, append = FALSE,
     Sys.sleep(wait_secs)
   }
   invisible(x)
+}
+
+
+# Depth-aware file discovery.
+#
+# Lists all files matching `pattern` within `dir`, up to `depth` subfolder
+# levels deep. Gracefully handles a requested depth that exceeds the actual
+# folder structure — it simply returns whatever exists without erroring.
+#
+# Args:
+#   dir     : root directory to search
+#   pattern : regex matched against filenames (same as FILE_PATTERN)
+#   depth   : max subfolder depth (0 = root only, 1 = root + 1 level, etc.)
+#
+# Returns: character vector of full file paths, sorted
+list_files_depth <- function(dir, pattern, depth) {
+  if (!dir.exists(dir)) stop("INPUT_DIR does not exist: ", dir)
+
+  # Depth 0: skip recursion entirely
+  if (depth == 0) {
+    return(sort(list.files(dir, pattern = pattern,
+                           full.names = TRUE, recursive = FALSE)))
+  }
+
+  # Get every matching file recursively, then filter by depth
+  all_files <- list.files(dir, pattern = pattern,
+                          full.names = TRUE, recursive = TRUE)
+  if (length(all_files) == 0) return(character(0))
+
+  # Normalise separators so depth counting works on Windows and Unix
+  norm      <- function(p) gsub("\\\\", "/", p)
+  root      <- norm(dir)
+  if (!endsWith(root, "/")) root <- paste0(root, "/")
+  root_esc  <- gsub("([.+*?|(){}\\[\\]^$])", "\\\\\\1", root)
+
+  rel_paths  <- sub(paste0("^", root_esc), "", norm(all_files))
+  # Number of "/" in relative path = subfolder depth of the file
+  file_depth <- nchar(gsub("[^/]", "", rel_paths))
+
+  sort(all_files[file_depth <= depth])
+}
+
+
+# Build an ASCII file tree of the discovered files.
+#
+# Shows only the files that will be processed (matching FILE_PATTERN up to
+# SEARCH_DEPTH), grouped by their folder structure.
+#
+# Args:
+#   files           : character vector of full file paths to display
+#   root_dir        : INPUT_DIR (used as the tree root label)
+#   depth_requested : SEARCH_DEPTH value (shown in the header for reference)
+#
+# Returns: character vector — one element per line of the rendered tree
+build_file_tree <- function(files, root_dir, depth_requested) {
+
+  norm     <- function(p) gsub("\\\\", "/", p)
+  root     <- norm(root_dir)
+  if (!endsWith(root, "/")) root <- paste0(root, "/")
+  root_esc <- gsub("([.+*?|(){}\\[\\]^$])", "\\\\\\1", root)
+
+  rel          <- sort(sub(paste0("^", root_esc), "", norm(files)))
+  depth_actual <- if (length(rel) > 0) max(nchar(gsub("[^/]", "", rel))) else 0
+
+  header <- sprintf(
+    "%s  [depth requested: %d | deepest file: %d level(s) | %d file(s) to process]",
+    basename(root_dir), depth_requested, depth_actual, length(files)
+  )
+
+  if (length(files) == 0) {
+    return(c(header, "  (no matching files found)"))
+  }
+
+  # Recursive renderer — takes relative paths and a hanging-indent prefix
+  render_node <- function(paths, prefix) {
+    if (length(paths) == 0) return(character(0))
+
+    # Split each path into its first component (head) and the rest (tail)
+    heads   <- sub("/.*$", "", paths)
+    is_file <- !grepl("/", paths, fixed = TRUE)  # no slash → leaf file at this level
+    tails   <- ifelse(is_file, NA_character_, sub("^[^/]*/", "", paths))
+
+    unique_heads <- unique(heads)
+    lines        <- character(0)
+
+    for (i in seq_along(unique_heads)) {
+      h        <- unique_heads[[i]]
+      is_last  <- (i == length(unique_heads))
+      conn     <- if (is_last) "\u2514\u2500\u2500 " else "\u251c\u2500\u2500 "
+      child_px <- if (is_last) paste0(prefix, "    ") else paste0(prefix, "\u2502   ")
+      idx      <- which(heads == h)
+
+      if (all(is_file[idx])) {
+        # Plain file — just emit the filename
+        lines <- c(lines, paste0(prefix, conn, h))
+      } else {
+        # Directory — emit the folder name then recurse into its children
+        children <- tails[idx]
+        children <- children[!is.na(children)]
+        lines    <- c(lines, paste0(prefix, conn, h, "/"))
+        lines    <- c(lines, render_node(children, child_px))
+      }
+    }
+    lines
+  }
+
+  c(header, render_node(rel, ""))
+}
+
+
+# Print and/or save the file tree.
+#
+# Args:
+#   tree_lines  : character vector returned by build_file_tree()
+#   output_mode : "console", "file", or "both"
+#   tree_path   : destination .txt path (used when output_mode is "file" or "both")
+emit_file_tree <- function(tree_lines, output_mode, tree_path) {
+  valid_modes <- c("console", "file", "both")
+  if (!output_mode %in% valid_modes) {
+    stop('TREE_OUTPUT must be one of: "console", "file", or "both". Got: "', output_mode, '"')
+  }
+
+  if (output_mode %in% c("console", "both")) {
+    cat(paste(tree_lines, collapse = "\n"), "\n\n")
+  }
+
+  if (output_mode %in% c("file", "both")) {
+    if (!dir.exists(dirname(tree_path))) {
+      dir.create(dirname(tree_path), recursive = TRUE, showWarnings = FALSE)
+    }
+    writeLines(
+      c(paste("Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S")), "", tree_lines),
+      tree_path
+    )
+    cat("  File tree saved to:", tree_path, "\n\n")
+  }
 }
 
 
@@ -1053,14 +1203,20 @@ plate_files <- if (!is.null(FILES)) {
   message("FILES supplied explicitly; ignoring INPUT_DIR, FILE_PATTERN, and SEARCH_DEPTH.")
   as.character(FILES)
 } else {
-  list.files(INPUT_DIR, pattern = FILE_PATTERN, full.names = TRUE)
+  list_files_depth(INPUT_DIR, FILE_PATTERN, SEARCH_DEPTH)
 }
+
+# Build and emit the file tree before any validation, so you can see
+# exactly what was found (or not found) even if something goes wrong below.
+tree_lines <- build_file_tree(plate_files, INPUT_DIR, SEARCH_DEPTH)
+emit_file_tree(tree_lines, TREE_OUTPUT, TREE_PATH)
 
 if (length(plate_files) == 0) {
   stop(
     "No matching files found.\n",
     "  INPUT_DIR    : ", INPUT_DIR,    "\n",
     "  FILE_PATTERN : ", FILE_PATTERN, "\n",
+    "  SEARCH_DEPTH : ", SEARCH_DEPTH, "\n",
     "Check that the folder exists and contains files matching FILE_PATTERN."
   )
 }
@@ -1070,9 +1226,6 @@ if (length(missing_files) > 0) {
   stop("The following files were found by the search but cannot be accessed:\n",
        paste(" -", missing_files, collapse = "\n"))
 }
-
-cat(sprintf("Found %d file(s) to process:\n", length(plate_files)))
-cat(paste(" -", plate_files, collapse = "\n"), "\n")
 
 # ----------------------------------------------------------
 # Log session-level variables once before the plate loop.
@@ -1088,6 +1241,9 @@ log_variables(
     INPUT_DIR      = INPUT_DIR,
     FILE_PATTERN   = FILE_PATTERN,
     FILES          = if (is.null(FILES)) "(auto-discovered)" else paste(FILES, collapse = "|"),
+    SEARCH_DEPTH   = SEARCH_DEPTH,
+    TREE_OUTPUT    = TREE_OUTPUT,
+    TREE_PATH      = TREE_PATH,
     OUTPUT_DIR     = OUTPUT_DIR,
     DEC_LOG_PATH   = DEC_LOG_PATH,
     VAR_LOG_PATH   = VAR_LOG_PATH,
@@ -1138,24 +1294,27 @@ if (isTRUE(SKIP_COMPLETED)) {
     if (skip_response == "Y") {
       skipped_plates <- skippable
       plate_files    <- plate_files[!completed]
-      cat(sprintf("\n  Skipping %d plate(s); %d remaining to process.\n\n",
+      cat(sprintf("\n  Skipping %d plate(s); %d file(s) remaining to process.\n\n",
                   length(skipped_plates), length(plate_files)))
     } else {
-      cat("\n  Reprocessing all plates.\n\n")
+      cat(sprintf("\n  Reprocessing all plates; %d file(s) to process.\n\n",
+                  length(plate_files)))
     }
 
   } else {
-    cat("  No completed plates found — all plates will be processed.\n")
+    cat(sprintf("  No completed plates found — all %d file(s) will be processed.\n",
+                length(plate_files)))
   }
 } else {
-  cat("  SKIP_COMPLETED is FALSE — processing all discovered plates.\n")
+  cat(sprintf("  SKIP_COMPLETED is FALSE — processing all %d discovered file(s).\n",
+              length(plate_files)))
 }
 
 # After skipping, check there is still something left to do
 if (length(plate_files) == 0) {
-  cat("\n  All discovered plates were skipped. Nothing to process.\n")
-  stop("No plates remaining after skip check. ",
-       "Set SKIP_COMPLETED <- FALSE to reprocess all.", call. = FALSE)
+  cat("\n  0 file(s) remaining to process — nothing to do.\n")
+  cat("  To reprocess completed plates, set SKIP_COMPLETED <- FALSE.\n")
+  stop("No plates remaining after skip check.", call. = FALSE)
 }
 
 
