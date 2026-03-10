@@ -27,7 +27,7 @@
 # to edit anything outside Sections 1 and 2.
 
 # --- Input ---
-INPUT_DIR    <- "data_raw/test/test1/"   # Folder containing plate CSV files.
+INPUT_DIR    <- "data_raw/"   # Folder containing plate CSV files.
 FILE_PATTERN <- "\\.csv$"    # Regex: which files to include (matched against filename).
 FILES        <- NULL         # Optional: explicit character vector of file paths.
 # If set, INPUT_DIR, FILE_PATTERN, and SEARCH_DEPTH
@@ -79,6 +79,28 @@ DEBUG_PRINT <- FALSE
 # If the script is run non-interactively (e.g. scheduled via Rscript), it
 # defaults to N — reprocess everything — and logs that no prompt was possible.
 SKIP_COMPLETED <- TRUE
+
+# --- Standards check ---
+# Before any data is removed, checks that every expected Std-001 … Std-NNN
+# entry is present in the Content column of each plate.
+# Plates with missing standards are gathered and you will be asked whether
+# to skip them or force them through with manually specified LOD overrides.
+STD_CHECK_ENABLED <- TRUE   # Set to FALSE to bypass the check entirely.
+N_STANDARDS       <- 6      # How many standards to expect (Std-001 … Std-006).
+
+# Per-target LOD overrides for plates forced through the standards check.
+# Keys must be lowercase target names matching your CSV files.
+# Required in non-interactive sessions; also offered as defaults interactively.
+# Set to NULL to be prompted to enter every value manually each time.
+STD_FORCE_LOD <- NULL
+# Example:
+# STD_FORCE_LOD <- list(
+#   LOD_Hi = list(nuc = 2000, fucp = 2000),
+#   LOD_Lo = list(nuc = 0.012, fucp = 0.012)
+# )
+
+# Separate audit log that records the outcome of every standards check.
+STD_LOG_PATH <- "audit/pcr_standards.csv"
 
 
 # ============================================================
@@ -210,25 +232,21 @@ write_csv_retry <- function(x, file, append = FALSE,
 list_files_depth <- function(dir, pattern, depth) {
   if (!dir.exists(dir)) stop("INPUT_DIR does not exist: ", dir)
 
-  # Depth 0: skip recursion entirely
   if (depth == 0) {
     return(sort(list.files(dir, pattern = pattern,
                            full.names = TRUE, recursive = FALSE)))
   }
 
-  # Get every matching file recursively, then filter by depth
   all_files <- list.files(dir, pattern = pattern,
                           full.names = TRUE, recursive = TRUE)
   if (length(all_files) == 0) return(character(0))
 
-  # Normalise separators so depth counting works on Windows and Unix
   norm      <- function(p) gsub("\\\\", "/", p)
   root      <- norm(dir)
   if (!endsWith(root, "/")) root <- paste0(root, "/")
   root_esc  <- gsub("([.+*?|(){}\\[\\]^$])", "\\\\\\1", root)
 
   rel_paths  <- sub(paste0("^", root_esc), "", norm(all_files))
-  # Number of "/" in relative path = subfolder depth of the file
   file_depth <- nchar(gsub("[^/]", "", rel_paths))
 
   sort(all_files[file_depth <= depth])
@@ -236,9 +254,6 @@ list_files_depth <- function(dir, pattern, depth) {
 
 
 # Build an ASCII file tree of the discovered files.
-#
-# Shows only the files that will be processed (matching FILE_PATTERN up to
-# SEARCH_DEPTH), grouped by their folder structure.
 #
 # Args:
 #   files           : character vector of full file paths to display
@@ -265,13 +280,11 @@ build_file_tree <- function(files, root_dir, depth_requested) {
     return(c(header, "  (no matching files found)"))
   }
 
-  # Recursive renderer — takes relative paths and a hanging-indent prefix
   render_node <- function(paths, prefix) {
     if (length(paths) == 0) return(character(0))
 
-    # Split each path into its first component (head) and the rest (tail)
     heads   <- sub("/.*$", "", paths)
-    is_file <- !grepl("/", paths, fixed = TRUE)  # no slash → leaf file at this level
+    is_file <- !grepl("/", paths, fixed = TRUE)
     tails   <- ifelse(is_file, NA_character_, sub("^[^/]*/", "", paths))
 
     unique_heads <- unique(heads)
@@ -285,10 +298,8 @@ build_file_tree <- function(files, root_dir, depth_requested) {
       idx      <- which(heads == h)
 
       if (all(is_file[idx])) {
-        # Plain file — just emit the filename
         lines <- c(lines, paste0(prefix, conn, h))
       } else {
-        # Directory — emit the folder name then recurse into its children
         children <- tails[idx]
         children <- children[!is.na(children)]
         lines    <- c(lines, paste0(prefix, conn, h, "/"))
@@ -328,6 +339,293 @@ emit_file_tree <- function(tree_lines, output_mode, tree_path) {
     )
     cat("  File tree saved to:", tree_path, "\n\n")
   }
+}
+
+
+# -------------------------------------------------------
+# Standards check helpers
+# -------------------------------------------------------
+
+# Reads a plate file and verifies that all expected Std-001 … Std-NNN entries
+# are present in the Content column.  Uses the same dynamic header detection
+# as process_plate() so results are consistent with what the pipeline will see.
+#
+# Args:
+#   file       : path to the plate CSV
+#   n_expected : integer; N_STANDARDS from Section 1
+#
+# Returns a named list:
+#   $passed   : TRUE if all standards found
+#   $expected : character vector of expected standard names
+#   $found    : character vector of standard names actually present
+#   $missing  : character vector of standard names absent
+#   $targets  : character vector of unique (lowercased) target names in the plate
+#   $error    : NULL on success; error message string if the file could not be read
+check_plate_standards <- function(file, n_expected) {
+  tryCatch({
+    raw_full <- read_csv(file, show_col_types = FALSE, col_names = FALSE,
+                         col_types = cols(.default = col_character()))
+    well_row <- which(raw_full[[1]] == "Well")
+
+    if (length(well_row) == 0)
+      return(list(passed = FALSE, expected = character(), found = character(),
+                  missing = character(), targets = character(),
+                  error = "Could not find 'Well' header row"))
+
+    well_row      <- well_row[1]
+    col_headers   <- as.character(raw_full[well_row, ])
+    raw           <- raw_full[(well_row + 1):nrow(raw_full), ]
+    colnames(raw) <- col_headers
+    raw           <- clean_col_names(raw)
+
+    if (!"content" %in% names(raw))
+      return(list(passed = FALSE, expected = character(), found = character(),
+                  missing = character(), targets = character(),
+                  error = "No 'content' column found after header detection"))
+
+    std_vals     <- as.character(raw$content)
+    std_present  <- sort(unique(std_vals[str_detect(std_vals,
+                                                    regex("^Std-\\d+$", ignore_case = TRUE))]))
+    std_expected <- sprintf("Std-%03d", seq_len(n_expected))
+    std_missing  <- std_expected[!tolower(std_expected) %in% tolower(std_present)]
+
+    targets <- character(0)
+    if ("target" %in% names(raw)) {
+      targets <- sort(unique(tolower(trimws(as.character(raw$target)))))
+      targets <- targets[!is.na(targets) & nzchar(targets)]
+    }
+
+    list(passed   = length(std_missing) == 0,
+         expected = std_expected,
+         found    = std_present,
+         missing  = std_missing,
+         targets  = targets,
+         error    = NULL)
+
+  }, error = function(e) {
+    list(passed = FALSE, expected = character(), found = character(),
+         missing = character(), targets = character(),
+         error = conditionMessage(e))
+  })
+}
+
+
+# Creates the standards audit log CSV with typed headers if it does not exist.
+ensure_std_log <- function(path) {
+  if (!dir.exists(dirname(path))) dir.create(dirname(path), recursive = TRUE)
+  if (!file.exists(path)) {
+    write_csv_retry(
+      tibble(
+        timestamp          = as_datetime(character()),
+        user               = character(),
+        run_id             = character(),
+        input_file         = character(),
+        n_expected         = integer(),
+        expected_standards = character(),
+        found_standards    = character(),
+        missing_standards  = character(),
+        action             = character(),  # "pass" | "skipped" | "forced" | "error"
+        lod_override       = character(),  # serialised per-target LOD, or NA
+        notes              = character(),
+        source             = character(),
+        version            = character()
+      ),
+      path
+    )
+  }
+  invisible(path)
+}
+
+# Appends one row to the standards audit log.
+#
+# Args:
+#   file         : plate file path
+#   n_expected   : N_STANDARDS value used for this check
+#   check_result : list returned by check_plate_standards()
+#   action       : "pass" | "skipped" | "forced" | "error"
+#   lod_override : per-target LOD list used for a forced plate, or NULL
+#   notes        : free-text string, or NULL
+#   run_id       : session run ID
+#   std_log_path : STD_LOG_PATH
+log_standard_check <- function(file, n_expected, check_result, action,
+                               lod_override = NULL, notes = NULL,
+                               run_id, std_log_path) {
+  ensure_std_log(std_log_path)
+  lod_str <- if (!is.null(lod_override)) .serialize_value(lod_override)$value else NA_character_
+  entry <- tibble(
+    timestamp          = now(tzone = "UTC"),
+    user               = Sys.info()[["user"]],
+    run_id             = run_id,
+    input_file         = basename(file),
+    n_expected         = as.integer(n_expected),
+    expected_standards = paste(check_result$expected, collapse = "|"),
+    found_standards    = paste(check_result$found,    collapse = "|"),
+    missing_standards  = paste(check_result$missing,  collapse = "|"),
+    action             = action,
+    lod_override       = lod_str,
+    notes              = as.character(notes %||% NA_character_),
+    source             = "R_script",
+    version            = "0.1.7"
+  )
+  write_csv_retry(entry, std_log_path, append = TRUE)
+  invisible(entry)
+}
+
+
+# Shows a combined console summary of all plates that failed the standards check,
+# then prompts the user to either skip them all or force them through.
+#
+# Interactive — force path: collects per-target LOD_Hi and LOD_Lo for each plate.
+#   STD_FORCE_LOD values are offered as defaults (press Enter to accept).
+#
+# Non-interactive — always forces through using STD_FORCE_LOD.
+#   Errors if STD_FORCE_LOD is NULL, since no values can be entered.
+#
+# Args:
+#   failing_info  : list of named lists, one per failing plate:
+#                   $file, $found, $missing, $targets, $error
+#   n_expected    : N_STANDARDS
+#   std_force_lod : STD_FORCE_LOD from Section 1
+#
+# Returns a named list:
+#   $skip_files : character vector of file paths to remove from processing
+#   $force_lods : named list of per-file LOD overrides (keyed by file path)
+ask_standards_action <- function(failing_info, n_expected, std_force_lod) {
+
+  n_fail <- length(failing_info)
+
+  # ---- Print combined failure summary ----
+  cat(sprintf("\n%s\n", strrep("-", .pg_width)))
+  cat(sprintf(
+    " Standards check: %d plate(s) failed (expected %d standards: %s)\n",
+    n_fail, n_expected,
+    paste(sprintf("Std-%03d", seq_len(n_expected)), collapse = ", ")
+  ))
+  cat(strrep("-", .pg_width), "\n")
+
+  for (fi in failing_info) {
+    if (!is.null(fi$error)) {
+      cat(sprintf("  [ERROR] %s\n    Could not read file: %s\n\n",
+                  file_stem(fi$file), fi$error))
+    } else {
+      cat(sprintf(
+        "  %s\n    Found   : %s\n    Missing : %s\n\n",
+        file_stem(fi$file),
+        if (length(fi$found)   == 0) "(none)" else paste(fi$found,   collapse = ", "),
+        if (length(fi$missing) == 0) "(none)" else paste(fi$missing, collapse = ", ")
+      ))
+    }
+  }
+  cat(strrep("-", .pg_width), "\n")
+
+  # ---- Non-interactive path ----
+  if (!interactive()) {
+    if (is.null(std_force_lod)) {
+      stop(
+        "Standards check failed for ", n_fail, " plate(s) in a non-interactive session,\n",
+        "but STD_FORCE_LOD is NULL.\n",
+        "Set STD_FORCE_LOD in Section 1 to provide fallback LOD values, or resolve\n",
+        "the missing standards in the raw data before re-running.",
+        call. = FALSE
+      )
+    }
+    cat(sprintf(
+      "\n  [non-interactive] Auto-forcing %d plate(s) through with STD_FORCE_LOD.\n\n",
+      n_fail
+    ))
+    force_lods <- setNames(
+      lapply(failing_info, function(fi) std_force_lod),
+      vapply(failing_info, function(fi) fi$file, character(1))
+    )
+    return(list(skip_files = character(0), force_lods = force_lods))
+  }
+
+  # ---- Interactive path ----
+  cat(" Options:\n")
+  cat("   S = Skip all failing plates (excluded from this run)\n")
+  cat("   F = Force all failing plates through (you will supply LOD overrides)\n")
+  cat(" Enter S or F: ")
+
+  response <- toupper(trimws(readline()))
+  while (!response %in% c("S", "F")) {
+    cat("  Please enter S or F: ")
+    response <- toupper(trimws(readline()))
+  }
+
+  if (response == "S") {
+    skip_files <- vapply(failing_info, function(fi) fi$file, character(1))
+    cat(sprintf("  Skipping %d plate(s).\n\n", length(skip_files)))
+    return(list(skip_files = skip_files, force_lods = list()))
+  }
+
+  # ---- Force: collect per-target LOD for each plate ----
+  cat(sprintf(
+    "\n  You will now enter LOD overrides for each plate.\n  (STD_FORCE_LOD %s — shown as [default] where applicable)\n\n",
+    if (is.null(std_force_lod)) "is NOT defined" else "is defined"
+  ))
+
+  force_lods <- list()
+
+  for (fi in failing_info) {
+    stem_label <- file_stem(fi$file)
+    cat(sprintf("  --- %s ---\n", stem_label))
+
+    if (length(fi$targets) == 0) {
+      cat("  Warning: no targets found in this plate.\n")
+      if (is.null(std_force_lod))
+        stop("Cannot force '", stem_label, "': no targets found and STD_FORCE_LOD is NULL.",
+             call. = FALSE)
+      cat("  Using STD_FORCE_LOD directly.\n\n")
+      force_lods[[fi$file]] <- std_force_lod
+      next
+    }
+
+    lod_hi_out <- list()
+    lod_lo_out <- list()
+
+    for (tgt in fi$targets) {
+      def_hi <- tryCatch(std_force_lod$LOD_Hi[[tgt]], error = function(e) NULL)
+      def_lo <- tryCatch(std_force_lod$LOD_Lo[[tgt]], error = function(e) NULL)
+
+      # LOD_Hi
+      cat(sprintf("    Target '%s'  LOD_Hi%s: ", tgt,
+                  if (!is.null(def_hi)) sprintf(" [default: %g]", def_hi) else ""))
+      raw_in <- trimws(readline())
+      if (raw_in == "" && !is.null(def_hi)) {
+        hi_val <- def_hi
+        cat(sprintf("    → Accepted default: %g\n", hi_val))
+      } else {
+        hi_val <- suppressWarnings(as.numeric(raw_in))
+        while (is.na(hi_val) || hi_val <= 0) {
+          cat(sprintf("    Please enter a positive number for LOD_Hi ('%s'): ", tgt))
+          hi_val <- suppressWarnings(as.numeric(trimws(readline())))
+        }
+      }
+
+      # LOD_Lo
+      cat(sprintf("    Target '%s'  LOD_Lo%s: ", tgt,
+                  if (!is.null(def_lo)) sprintf(" [default: %g]", def_lo) else ""))
+      raw_in <- trimws(readline())
+      if (raw_in == "" && !is.null(def_lo)) {
+        lo_val <- def_lo
+        cat(sprintf("    → Accepted default: %g\n", lo_val))
+      } else {
+        lo_val <- suppressWarnings(as.numeric(raw_in))
+        while (is.na(lo_val) || lo_val <= 0) {
+          cat(sprintf("    Please enter a positive number for LOD_Lo ('%s'): ", tgt))
+          lo_val <- suppressWarnings(as.numeric(trimws(readline())))
+        }
+      }
+
+      lod_hi_out[[tgt]] <- hi_val
+      lod_lo_out[[tgt]] <- lo_val
+    }
+
+    force_lods[[fi$file]] <- list(LOD_Hi = lod_hi_out, LOD_Lo = lod_lo_out)
+    cat(sprintf("  LOD override recorded for %s.\n\n", stem_label))
+  }
+
+  list(skip_files = character(0), force_lods = force_lods)
 }
 
 
@@ -511,7 +809,7 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
     outcome    = outcome,
     evidence   = evidence,
     source     = "R_script",
-    version    = "0.1.6"
+    version    = "0.1.7"
   )
   write_csv_retry(entry, dec_log_path, append = TRUE)
   invisible(entry)
@@ -615,7 +913,7 @@ log_variables <- function(vars, run_id, var_log_path, default_file,
     var_value  = var_values,
     var_class  = var_class,
     source     = "R_script",
-    version    = "0.1.0"
+    version    = "0.1.7"
   )
 
   write_csv_retry(entry, var_log_path, append = TRUE)
@@ -671,6 +969,7 @@ log_variables_from_df <- function(df, cols, run_id, var_log_path,
 
 process_plate <- function(file,
                           LOD_Lo = NULL, LOD_Hi = NULL, LOD_List = NULL,
+                          force_lod_list = NULL,
                           dCq_thr,
                           rm_patterns, rm_cols_req,
                           plate_index, n_plates,
@@ -693,7 +992,8 @@ process_plate <- function(file,
   # ----------------------------------------------------------
   pg_step_start(0, "Import — locating header row")
 
-  raw_full  <- read_csv(file, show_col_types = FALSE, col_names = FALSE)
+  raw_full  <- read_csv(file, show_col_types = FALSE, col_names = FALSE,
+                        col_types = cols(.default = col_character()))
   well_row  <- which(raw_full[[1]] == "Well")
 
   if (length(well_row) == 0) {
@@ -730,12 +1030,20 @@ process_plate <- function(file,
 
   # ----------------------------------------------------------
   # LOD resolution
-  # Preferred: per-target list (TARGET_LOD).
-  # Fallback:  scalar LOD_Lo and LOD_Hi passed directly.
+  # Priority: force_lod_list (standards-check override) > LOD_List > scalar.
+  # force_lod_list is only set for plates that were forced through the
+  # standards pre-check with user-supplied LOD values.
   # ----------------------------------------------------------
   targets <- NULL  # initialise here so it is always in scope for variable logging
 
-  if (!is.null(LOD_List)) {
+  effective_lod_list <- if (!is.null(force_lod_list)) {
+    cat(sprintf("  %-16s\u2502 using forced LOD override (standards check bypassed)\n", "LOD"))
+    force_lod_list
+  } else {
+    LOD_List
+  }
+
+  if (!is.null(effective_lod_list)) {
 
     targets <- dat |>
       pull(target) |>
@@ -748,13 +1056,13 @@ process_plate <- function(file,
       stop("NA present in `target` column of ", file, ". Please correct raw data.")
     }
 
-    missing_hi <- setdiff(targets, names(LOD_List$LOD_Hi))
-    missing_lo <- setdiff(targets, names(LOD_List$LOD_Lo))
+    missing_hi <- setdiff(targets, names(effective_lod_list$LOD_Hi))
+    missing_lo <- setdiff(targets, names(effective_lod_list$LOD_Lo))
     if (length(missing_hi)) stop("Missing targets in LOD_Hi: ", paste(missing_hi, collapse = ", "))
     if (length(missing_lo)) stop("Missing targets in LOD_Lo: ", paste(missing_lo, collapse = ", "))
 
-    hi_vals <- as.numeric(unlist(LOD_List$LOD_Hi[targets]))
-    lo_vals <- as.numeric(unlist(LOD_List$LOD_Lo[targets]))
+    hi_vals <- as.numeric(unlist(effective_lod_list$LOD_Hi[targets]))
+    lo_vals <- as.numeric(unlist(effective_lod_list$LOD_Lo[targets]))
 
     tol <- 1e-9
 
@@ -1238,16 +1546,19 @@ assign(".current_input_file", "(session)", envir = .GlobalEnv)
 
 log_variables(
   vars = list(
-    INPUT_DIR      = INPUT_DIR,
-    FILE_PATTERN   = FILE_PATTERN,
-    FILES          = if (is.null(FILES)) "(auto-discovered)" else paste(FILES, collapse = "|"),
-    SEARCH_DEPTH   = SEARCH_DEPTH,
-    TREE_OUTPUT    = TREE_OUTPUT,
-    TREE_PATH      = TREE_PATH,
-    OUTPUT_DIR     = OUTPUT_DIR,
-    DEC_LOG_PATH   = DEC_LOG_PATH,
-    VAR_LOG_PATH   = VAR_LOG_PATH,
-    SKIP_COMPLETED = SKIP_COMPLETED
+    INPUT_DIR         = INPUT_DIR,
+    FILE_PATTERN      = FILE_PATTERN,
+    FILES             = if (is.null(FILES)) "(auto-discovered)" else paste(FILES, collapse = "|"),
+    SEARCH_DEPTH      = SEARCH_DEPTH,
+    TREE_OUTPUT       = TREE_OUTPUT,
+    TREE_PATH         = TREE_PATH,
+    OUTPUT_DIR        = OUTPUT_DIR,
+    DEC_LOG_PATH      = DEC_LOG_PATH,
+    VAR_LOG_PATH      = VAR_LOG_PATH,
+    SKIP_COMPLETED    = SKIP_COMPLETED,
+    STD_CHECK_ENABLED = STD_CHECK_ENABLED,
+    N_STANDARDS       = N_STANDARDS,
+    STD_LOG_PATH      = STD_LOG_PATH
   ),
   run_id       = .session_run_id,
   var_log_path = VAR_LOG_PATH,
@@ -1294,27 +1605,116 @@ if (isTRUE(SKIP_COMPLETED)) {
     if (skip_response == "Y") {
       skipped_plates <- skippable
       plate_files    <- plate_files[!completed]
-      cat(sprintf("\n  Skipping %d plate(s); %d file(s) remaining to process.\n\n",
+      cat(sprintf("\n  Skipping %d plate(s); %d remaining to process.\n\n",
                   length(skipped_plates), length(plate_files)))
     } else {
-      cat(sprintf("\n  Reprocessing all plates; %d file(s) to process.\n\n",
-                  length(plate_files)))
+      cat("\n  Reprocessing all plates.\n\n")
     }
 
   } else {
-    cat(sprintf("  No completed plates found — all %d file(s) will be processed.\n",
-                length(plate_files)))
+    cat("  No completed plates found — all plates will be processed.\n")
   }
 } else {
-  cat(sprintf("  SKIP_COMPLETED is FALSE — processing all %d discovered file(s).\n",
-              length(plate_files)))
+  cat("  SKIP_COMPLETED is FALSE — processing all discovered plates.\n")
 }
 
 # After skipping, check there is still something left to do
 if (length(plate_files) == 0) {
-  cat("\n  0 file(s) remaining to process — nothing to do.\n")
-  cat("  To reprocess completed plates, set SKIP_COMPLETED <- FALSE.\n")
-  stop("No plates remaining after skip check.", call. = FALSE)
+  cat("\n  All discovered plates were skipped. Nothing to process.\n")
+  stop("No plates remaining after skip check. ",
+       "Set SKIP_COMPLETED <- FALSE to reprocess all.", call. = FALSE)
+}
+
+
+# ----------------------------------------------------------
+# Standards pre-check
+# Reads every remaining plate file and verifies that all
+# expected Std-001 … Std-NNN entries are present in the
+# Content column BEFORE any rows are removed.
+#
+# Failing plates are collected first, then a single combined
+# prompt lets the user either skip them or force them through
+# with manually entered per-target LOD overrides.
+# All outcomes (pass / skipped / forced / error) are written
+# to STD_LOG_PATH for audit purposes.
+# ----------------------------------------------------------
+std_skipped_plates <- character(0)  # stems of plates removed by standards check
+std_force_lods     <- list()        # named by file path; LOD override per forced plate
+
+if (isTRUE(STD_CHECK_ENABLED) && !is.null(N_STANDARDS) && N_STANDARDS > 0) {
+
+  cat(sprintf(
+    "\n  Standards check: verifying Std-001 … Std-%03d across %d plate(s)...\n",
+    N_STANDARDS, length(plate_files)
+  ))
+
+  std_results <- lapply(plate_files, check_plate_standards, n_expected = N_STANDARDS)
+  names(std_results) <- plate_files
+
+  # Log passed plates immediately; collect failures for the prompt
+  failing_info <- list()
+  for (fp in plate_files) {
+    res <- std_results[[fp]]
+    if (!is.null(res$error)) {
+      failing_info[[length(failing_info) + 1]] <- c(list(file = fp), res)
+    } else if (res$passed) {
+      log_standard_check(fp, N_STANDARDS, res, action = "pass",
+                         run_id = .session_run_id, std_log_path = STD_LOG_PATH)
+    } else {
+      failing_info[[length(failing_info) + 1]] <- c(list(file = fp), res)
+    }
+  }
+
+  n_pass <- length(plate_files) - length(failing_info)
+  cat(sprintf("  Standards check: %d passed, %d failed.\n", n_pass, length(failing_info)))
+
+  if (length(failing_info) > 0) {
+
+    std_action <- ask_standards_action(failing_info, N_STANDARDS, STD_FORCE_LOD)
+
+    # Process skip decisions
+    if (length(std_action$skip_files) > 0) {
+      std_skipped_plates <- file_stem(std_action$skip_files)
+      plate_files        <- plate_files[!plate_files %in% std_action$skip_files]
+
+      for (fp in std_action$skip_files) {
+        log_standard_check(fp, N_STANDARDS, std_results[[fp]],
+                           action = "skipped",
+                           notes  = "User chose to skip this plate",
+                           run_id = .session_run_id, std_log_path = STD_LOG_PATH)
+      }
+      cat(sprintf("\n  Standards check: skipping %d plate(s); %d file(s) remaining.\n\n",
+                  length(std_skipped_plates), length(plate_files)))
+    }
+
+    # Process forced-through decisions
+    if (length(std_action$force_lods) > 0) {
+      std_force_lods <- std_action$force_lods
+
+      for (fp in names(std_force_lods)) {
+        log_standard_check(fp, N_STANDARDS, std_results[[fp]],
+                           action       = "forced",
+                           lod_override = std_force_lods[[fp]],
+                           notes        = if (!interactive())
+                             "Non-interactive session: auto-forced with STD_FORCE_LOD"
+                           else
+                             "User forced plate through with manual LOD override",
+                           run_id       = .session_run_id,
+                           std_log_path = STD_LOG_PATH)
+      }
+      cat(sprintf("  Standards check: %d plate(s) forced through with LOD overrides.\n\n",
+                  length(std_force_lods)))
+    }
+  }
+
+} else {
+  cat("  STD_CHECK_ENABLED is FALSE — standards check skipped.\n")
+}
+
+# Guard: nothing left after standards filtering
+if (length(plate_files) == 0) {
+  cat("\n  0 file(s) remaining after standards check — nothing to do.\n")
+  stop("No plates remaining after standards filtering.", call. = FALSE)
 }
 
 
@@ -1326,6 +1726,7 @@ results <- lapply(seq_along(plate_files), function(i) {
   process_plate(
     file           = plate_files[[i]],
     LOD_List       = TARGET_LOD,           # Remove this line and set LOD_Lo / LOD_Hi
+    force_lod_list = std_force_lods[[plate_files[[i]]]],   # NULL unless standards-forced
     dCq_thr        = DELTA_CQ_THRESHOLD,   # directly if not using per-target LODs
     rm_patterns    = RM_PATTERNS,
     rm_cols_req    = RM_COLUMNS,
@@ -1371,6 +1772,18 @@ if (length(skipped_plates) > 0) {
     dry_run  = NA
   )
   summary_tbl <- bind_rows(summary_tbl, skipped_tbl)
+}
+
+if (length(std_skipped_plates) > 0) {
+  std_skip_tbl <- tibble(
+    plate    = std_skipped_plates,
+    status   = "skipped (failed standards check)",
+    rows_in  = NA_integer_,
+    rows_out = NA_integer_,
+    review   = NA_integer_,
+    dry_run  = NA
+  )
+  summary_tbl <- bind_rows(summary_tbl, std_skip_tbl)
 }
 
 print(summary_tbl)
