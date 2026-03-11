@@ -81,8 +81,13 @@ DEBUG_PRINT <- FALSE
 SKIP_COMPLETED <- TRUE
 
 # --- Standards check ---
-# Before any data is removed, checks that every expected Std-001 … Std-NNN
-# entry is present in the Content column of each plate.
+# Before any data is removed, checks that every expected standard is present
+# in the Content column of each plate.  Both canonical labelling (Std-001,
+# Std-002 …) and abbreviated labelling (Std-01, Std-02 …) are accepted; all
+# found labels are normalised to Std-NNN internally for comparison.
+# Plates whose standards use the abbreviated (01/02) style will produce a
+# console warning and an audit-log note, but will still be processed provided
+# no standards are actually missing.
 # Plates with missing standards are gathered and you will be asked whether
 # to skip them or force them through with manually specified LOD overrides.
 STD_CHECK_ENABLED <- TRUE   # Set to FALSE to bypass the check entirely.
@@ -355,12 +360,15 @@ emit_file_tree <- function(tree_lines, output_mode, tree_path) {
 #   n_expected : integer; N_STANDARDS from Section 1
 #
 # Returns a named list:
-#   $passed   : TRUE if all standards found
-#   $expected : character vector of expected standard names
-#   $found    : character vector of standard names actually present
-#   $missing  : character vector of standard names absent
-#   $targets  : character vector of unique (lowercased) target names in the plate
-#   $error    : NULL on success; error message string if the file could not be read
+#   $passed       : TRUE if all standards found (after normalisation)
+#   $expected     : character vector of expected standard names (canonical Std-NNN form)
+#   $found        : character vector of standard names exactly as they appear in the file
+#   $found_norm   : character vector of found names normalised to canonical Std-NNN form
+#   $missing      : character vector of standard names absent (canonical form)
+#   $targets      : character vector of unique (lowercased) target names in the plate
+#   $label_style  : "standard" (all Std-001), "short" (all Std-01), "mixed", or "unknown"
+#   $label_warning: NULL when style is canonical; descriptive string otherwise
+#   $error        : NULL on success; error message string if the file could not be read
 check_plate_standards <- function(file, n_expected) {
   tryCatch({
     raw_full <- read_csv(file, show_col_types = FALSE, col_names = FALSE,
@@ -369,7 +377,9 @@ check_plate_standards <- function(file, n_expected) {
 
     if (length(well_row) == 0)
       return(list(passed = FALSE, expected = character(), found = character(),
-                  missing = character(), targets = character(),
+                  found_norm = character(), missing = character(),
+                  targets = character(), label_style = "unknown",
+                  label_warning = NULL,
                   error = "Could not find 'Well' header row"))
 
     well_row      <- well_row[1]
@@ -380,14 +390,54 @@ check_plate_standards <- function(file, n_expected) {
 
     if (!"content" %in% names(raw))
       return(list(passed = FALSE, expected = character(), found = character(),
-                  missing = character(), targets = character(),
+                  found_norm = character(), missing = character(),
+                  targets = character(), label_style = "unknown",
+                  label_warning = NULL,
                   error = "No 'content' column found after header detection"))
 
-    std_vals     <- as.character(raw$content)
-    std_present  <- sort(unique(std_vals[str_detect(std_vals,
-                                                    regex("^Std-\\d+$", ignore_case = TRUE))]))
+    std_vals <- as.character(raw$content)
+
+    # Detect standards in either Std-001 (3-digit) or Std-01 (2-digit) format.
+    std_present_raw <- sort(unique(std_vals[str_detect(std_vals,
+                                                       regex("^Std-0{0,2}[1-9]\\d?$",
+                                                             ignore_case = TRUE))]))
+
+    # Normalise all found labels to canonical 3-digit form (Std-001) so that
+    # both "Std-01" and "Std-001" resolve identically during the missing check.
+    normalize_std_label <- function(s) {
+      num <- suppressWarnings(
+        as.integer(sub("(?i)^std-0*", "", s, perl = TRUE))
+      )
+      sprintf("Std-%03d", num)
+    }
+    std_present_norm <- if (length(std_present_raw) > 0)
+      vapply(std_present_raw, normalize_std_label, character(1), USE.NAMES = FALSE)
+    else
+      character(0)
+
     std_expected <- sprintf("Std-%03d", seq_len(n_expected))
-    std_missing  <- std_expected[!tolower(std_expected) %in% tolower(std_present)]
+    std_missing  <- std_expected[!tolower(std_expected) %in% tolower(std_present_norm)]
+
+    # Classify label style: "standard" = all 3-digit, "short" = all ≤2-digit, "mixed".
+    is_short_fmt <- grepl("^Std-\\d{1,2}$", std_present_raw, ignore.case = TRUE)
+    is_long_fmt  <- grepl("^Std-\\d{3,}$",  std_present_raw, ignore.case = TRUE)
+    label_style  <- if      (length(std_present_raw) == 0) "unknown"
+    else if (all(is_long_fmt))              "standard"
+    else if (all(is_short_fmt))             "short"
+    else                                    "mixed"
+
+    # Compose a warning message for any non-canonical labelling.
+    label_warning <- if (label_style %in% c("short", "mixed")) {
+      sprintf(
+        "Standards use abbreviated labelling ('%s' style, e.g. '%s') instead of the canonical 3-digit format (e.g. '%s'). Found: %s",
+        label_style,
+        std_present_raw[1],
+        normalize_std_label(std_present_raw[1]),
+        paste(std_present_raw, collapse = ", ")
+      )
+    } else {
+      NULL
+    }
 
     targets <- character(0)
     if ("target" %in% names(raw)) {
@@ -395,16 +445,20 @@ check_plate_standards <- function(file, n_expected) {
       targets <- targets[!is.na(targets) & nzchar(targets)]
     }
 
-    list(passed   = length(std_missing) == 0,
-         expected = std_expected,
-         found    = std_present,
-         missing  = std_missing,
-         targets  = targets,
-         error    = NULL)
+    list(passed        = length(std_missing) == 0,
+         expected      = std_expected,
+         found         = std_present_raw,   # labels exactly as they appear in the file
+         found_norm    = std_present_norm,  # normalised to Std-NNN for audit/reference
+         missing       = std_missing,
+         targets       = targets,
+         label_style   = label_style,
+         label_warning = label_warning,
+         error         = NULL)
 
   }, error = function(e) {
     list(passed = FALSE, expected = character(), found = character(),
-         missing = character(), targets = character(),
+         found_norm = character(), missing = character(), targets = character(),
+         label_style = "unknown", label_warning = NULL,
          error = conditionMessage(e))
   })
 }
@@ -465,7 +519,7 @@ log_standard_check <- function(file, n_expected, check_result, action,
     lod_override       = lod_str,
     notes              = as.character(notes %||% NA_character_),
     source             = "R_script",
-    version            = "0.1.7"
+    version            = "0.1.8"
   )
   write_csv_retry(entry, std_log_path, append = TRUE)
   invisible(entry)
@@ -809,7 +863,7 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
     outcome    = outcome,
     evidence   = evidence,
     source     = "R_script",
-    version    = "0.1.7"
+    version    = "0.1.8"
   )
   write_csv_retry(entry, dec_log_path, append = TRUE)
   invisible(entry)
@@ -913,7 +967,7 @@ log_variables <- function(vars, run_id, var_log_path, default_file,
     var_value  = var_values,
     var_class  = var_class,
     source     = "R_script",
-    version    = "0.1.7"
+    version    = "0.1.8"
   )
 
   write_csv_retry(entry, var_log_path, append = TRUE)
@@ -1651,18 +1705,60 @@ if (isTRUE(STD_CHECK_ENABLED) && !is.null(N_STANDARDS) && N_STANDARDS > 0) {
   std_results <- lapply(plate_files, check_plate_standards, n_expected = N_STANDARDS)
   names(std_results) <- plate_files
 
-  # Log passed plates immediately; collect failures for the prompt
-  failing_info <- list()
+  # Log passed plates immediately; collect failures for the prompt.
+  # Plates that pass but use abbreviated labelling (Std-01 style) are still
+  # treated as passing — a console warning and audit-log note are emitted so
+  # the non-canonical labels are visible without blocking processing.
+  failing_info      <- list()
+  label_warned_info <- list()   # passed plates with non-canonical label style
+
   for (fp in plate_files) {
     res <- std_results[[fp]]
     if (!is.null(res$error)) {
       failing_info[[length(failing_info) + 1]] <- c(list(file = fp), res)
     } else if (res$passed) {
-      log_standard_check(fp, N_STANDARDS, res, action = "pass",
-                         run_id = .session_run_id, std_log_path = STD_LOG_PATH)
+      if (!is.null(res$label_warning)) {
+        # Passes on content (no missing standards) but uses Std-01/Std-02 labelling.
+        label_warned_info[[length(label_warned_info) + 1]] <- list(file = fp, res = res)
+        log_standard_check(fp, N_STANDARDS, res, action = "pass",
+                           notes  = paste0("Non-canonical label style ('", res$label_style,
+                                           "'): ", res$label_warning,
+                                           " — plate processed; no standards missing."),
+                           run_id = .session_run_id, std_log_path = STD_LOG_PATH)
+      } else {
+        log_standard_check(fp, N_STANDARDS, res, action = "pass",
+                           run_id = .session_run_id, std_log_path = STD_LOG_PATH)
+      }
     } else {
       failing_info[[length(failing_info) + 1]] <- c(list(file = fp), res)
     }
+  }
+
+  # Print per-plate label warnings for any plates using abbreviated Std-01 style.
+  if (length(label_warned_info) > 0) {
+    cat(sprintf("\n%s\n", strrep("-", .pg_width)))
+    cat(sprintf(
+      " Standards label warning: %d plate(s) used abbreviated labelling (Std-01 style)\n",
+      length(label_warned_info)
+    ))
+    cat(sprintf(
+      " Expected canonical format: Std-%03d … Std-%03d\n",
+      1L, N_STANDARDS
+    ))
+    cat(sprintf(
+      " These plates will still be processed — no standards are missing.\n"
+    ))
+    cat(strrep("-", .pg_width), "\n")
+    for (lw in label_warned_info) {
+      cat(sprintf(
+        "  %s\n    Label style : %s\n    Found       : %s\n    Normalised  : %s\n\n",
+        file_stem(lw$file),
+        lw$res$label_style,
+        paste(lw$res$found,      collapse = ", "),
+        paste(lw$res$found_norm, collapse = ", ")
+      ))
+    }
+    cat(strrep("-", .pg_width), "\n\n")
   }
 
   n_pass <- length(plate_files) - length(failing_info)
