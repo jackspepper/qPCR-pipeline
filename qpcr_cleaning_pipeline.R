@@ -107,6 +107,17 @@ STD_FORCE_LOD <- NULL
 # Separate audit log that records the outcome of every standards check.
 STD_LOG_PATH <- "audit/pcr_standards.csv"
 
+# --- Run log ---
+# A plain-text transcript of all console output produced during the run.
+# Written (or overwritten) each time the script is sourced.  Intended as
+# a quick human-readable overview: verify all plates were processed, and
+# that the row counts and QC tallies at each step look reasonable.
+# Set to NULL to disable entirely.
+# NOTE: if the script exits with an ERROR before reaching the end, the
+# sink may be left open and further R console output will not display.
+# To recover, run  sink()  once in the R console.
+RUN_LOG_PATH <- "audit/pcr_run_log.txt"
+
 
 # ============================================================
 # SECTION 2: LOD (Limit of Detection) Definitions
@@ -519,7 +530,7 @@ log_standard_check <- function(file, n_expected, check_result, action,
     lod_override       = lod_str,
     notes              = as.character(notes %||% NA_character_),
     source             = "R_script",
-    version            = "0.1.8"
+    version            = "0.1.9"
   )
   write_csv_retry(entry, std_log_path, append = TRUE)
   invisible(entry)
@@ -788,9 +799,21 @@ pg_step_done <- function(step_num, detail = NULL) {
 }
 
 # Print the final summary line at the end of a plate.
-pg_summary <- function(n_out, n_review) {
+#
+# Args:
+#   n_out        : rows in the all_samples output
+#   n_review     : rows flagged for review
+#   elapsed_secs : wall-clock seconds from plate start to here (Sys.time() diff)
+pg_summary <- function(n_out, n_review, elapsed_secs) {
+  rate_str <- if (!is.na(elapsed_secs) && n_out > 0)
+    sprintf(" | %.3fs/row", elapsed_secs / n_out)
+  else
+    ""
   cat(strrep("\u2500", .pg_width), "\n", sep = "")
-  cat(sprintf("  Output  \u2502 %d rows out \u2502 %d for review\n", n_out, n_review))
+  cat(sprintf(
+    "  Output  | %d rows out | %d for review | %.1fs%s\n",
+    n_out, n_review, elapsed_secs, rate_str
+  ))
 }
 
 
@@ -863,7 +886,7 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
     outcome    = outcome,
     evidence   = evidence,
     source     = "R_script",
-    version    = "0.1.8"
+    version    = "0.1.9"
   )
   write_csv_retry(entry, dec_log_path, append = TRUE)
   invisible(entry)
@@ -967,7 +990,7 @@ log_variables <- function(vars, run_id, var_log_path, default_file,
     var_value  = var_values,
     var_class  = var_class,
     source     = "R_script",
-    version    = "0.1.8"
+    version    = "0.1.9"
   )
 
   write_csv_retry(entry, var_log_path, append = TRUE)
@@ -1037,9 +1060,7 @@ process_plate <- function(file,
   run_id <- paste0(format(Sys.time(), "%Y%m%d_%H%M%S"), "_", stem)
 
   pg_plate(plate_index, n_plates, file)
-
-  # ----------------------------------------------------------
-  # Import
+  .plate_start <- Sys.time()  # wall-clock timer for per-plate elapsed time
   # Rather than hardcoding a skip row, we read the whole file
   # and locate the first row where column 1 contains "Well".
   # Everything from that row onward becomes the data table.
@@ -1541,8 +1562,10 @@ process_plate <- function(file,
   write_csv_retry(all_samples,    all_path,    na = "")
   write_csv_retry(review_samples, review_path, na = "")
 
+  .plate_elapsed <- as.numeric(difftime(Sys.time(), .plate_start, units = "secs"))
+
   pg_step_done(5)
-  pg_summary(nrow(all_samples), nrow(review_samples))
+  pg_summary(nrow(all_samples), nrow(review_samples), .plate_elapsed)
 
   invisible(list(
     stem            = stem,
@@ -1551,6 +1574,7 @@ process_plate <- function(file,
     n_in            = nrow(raw),
     n_out           = nrow(all_samples),
     n_review        = nrow(review_samples),
+    elapsed_secs    = .plate_elapsed,
     preview_enabled = isTRUE(enable_preview),
     dry_run         = isTRUE(dry_run)
   ))
@@ -1560,6 +1584,33 @@ process_plate <- function(file,
 # ============================================================
 # SECTION 8: Discover, Validate, and Filter Plate Files
 # ============================================================
+
+# ----------------------------------------------------------
+# Open run log sink
+# Must come before any cat()/print() output so the full
+# session transcript — file tree, standards check, per-plate
+# progress, and summary — is all captured in one place.
+# split = TRUE means output still appears on the console.
+# ----------------------------------------------------------
+if (!is.null(RUN_LOG_PATH)) {
+  if (!dir.exists(dirname(RUN_LOG_PATH)))
+    dir.create(dirname(RUN_LOG_PATH), recursive = TRUE, showWarnings = FALSE)
+  .run_log_con   <- file(RUN_LOG_PATH, open = "wt")
+  .run_log_start <- Sys.time()
+  sink(.run_log_con, split = TRUE, type = "output")
+
+  cat(strrep("=", .pg_width), "\n", sep = "")
+  cat(" qPCR Pipeline Run Log\n")
+  cat(strrep("-", .pg_width), "\n", sep = "")
+  cat(sprintf(" Directory  : %s\n", getwd()))
+  cat(sprintf(" Started    : %s\n", format(.run_log_start, "%Y-%m-%d %H:%M:%S")))
+  cat(sprintf(" User       : %s\n", Sys.info()[["user"]]))
+  cat(sprintf(" Input      : %s\n",
+              if (!is.null(FILES)) paste(basename(FILES), collapse = ", ") else INPUT_DIR))
+  cat(sprintf(" Output     : %s\n", OUTPUT_DIR))
+  cat(sprintf(" Audit      : %s\n", dirname(DEC_LOG_PATH)))
+  cat(strrep("=", .pg_width), "\n\n", sep = "")
+}
 
 plate_files <- if (!is.null(FILES)) {
   message("FILES supplied explicitly; ignoring INPUT_DIR, FILE_PATTERN, and SEARCH_DEPTH.")
@@ -1848,41 +1899,74 @@ cat(strrep("=", .pg_width), "\n", sep = "")
 
 summary_tbl <- bind_rows(lapply(results, function(r) {
   tibble(
-    plate    = r$stem,
-    status   = "processed",
-    rows_in  = r$n_in,
-    rows_out = r$n_out,
-    review   = r$n_review,
-    dry_run  = r$dry_run
+    plate        = r$stem,
+    status       = "processed",
+    rows_in      = r$n_in,
+    rows_out     = r$n_out,
+    review       = r$n_review,
+    elapsed_s    = round(r$elapsed_secs, 1),
+    secs_per_row = if (!is.na(r$elapsed_secs) && r$n_out > 0)
+      round(r$elapsed_secs / r$n_out, 4)
+    else NA_real_,
+    dry_run      = r$dry_run
   )
 }))
 
 # Append skipped plates as their own rows if any were skipped
 if (length(skipped_plates) > 0) {
   skipped_tbl <- tibble(
-    plate    = skipped_plates,
-    status   = "skipped (outputs already existed)",
-    rows_in  = NA_integer_,
-    rows_out = NA_integer_,
-    review   = NA_integer_,
-    dry_run  = NA
+    plate        = skipped_plates,
+    status       = "skipped (outputs already existed)",
+    rows_in      = NA_integer_,
+    rows_out     = NA_integer_,
+    review       = NA_integer_,
+    elapsed_s    = NA_real_,
+    secs_per_row = NA_real_,
+    dry_run      = NA
   )
   summary_tbl <- bind_rows(summary_tbl, skipped_tbl)
 }
 
 if (length(std_skipped_plates) > 0) {
   std_skip_tbl <- tibble(
-    plate    = std_skipped_plates,
-    status   = "skipped (failed standards check)",
-    rows_in  = NA_integer_,
-    rows_out = NA_integer_,
-    review   = NA_integer_,
-    dry_run  = NA
+    plate        = std_skipped_plates,
+    status       = "skipped (failed standards check)",
+    rows_in      = NA_integer_,
+    rows_out     = NA_integer_,
+    review       = NA_integer_,
+    elapsed_s    = NA_real_,
+    secs_per_row = NA_real_,
+    dry_run      = NA
   )
   summary_tbl <- bind_rows(summary_tbl, std_skip_tbl)
 }
 
 print(summary_tbl)
+
+# ----------------------------------------------------------
+# Timing breakdown — processed plates only
+# Shows each plate's elapsed time, rows, and normalised rate
+# so that slower plates can be assessed relative to their size
+# rather than penalised for simply containing more data.
+# ----------------------------------------------------------
+timing_tbl <- summary_tbl |>
+  filter(status == "processed", !is.na(elapsed_s)) |>
+  select(plate, rows_out, elapsed_s, secs_per_row)
+
+if (nrow(timing_tbl) > 0) {
+  total_rows    <- sum(timing_tbl$rows_out,  na.rm = TRUE)
+  total_elapsed <- sum(timing_tbl$elapsed_s, na.rm = TRUE)
+  mean_rate     <- if (total_rows > 0) round(total_elapsed / total_rows, 4) else NA_real_
+  slowest_plate <- timing_tbl$plate[which.max(timing_tbl$secs_per_row)]
+
+  cat("\n--- Per-plate timing (processed plates) ---\n")
+  print(timing_tbl)
+
+  cat(sprintf(
+    "\n  Total rows processed : %d\n  Total plate time     : %.1fs\n  Mean rate            : %.4fs/row\n  Slowest (normalised) : %s\n",
+    total_rows, total_elapsed, mean_rate, slowest_plate
+  ))
+}
 
 
 # ============================================================
@@ -1903,4 +1987,40 @@ if (file.exists(DEC_LOG_PATH)) {
   rm(audit)
 } else {
   cat("No audit log found at:", DEC_LOG_PATH, "\n")
+}
+
+
+# ============================================================
+# SECTION 12: Close Run Log
+# ============================================================
+# Writes a footer to the run log (elapsed time, save path) and
+# closes the sink so the file is fully flushed to disk.
+# The closing message is written INSIDE the sink so it appears
+# in the log, then after sink() the save-path confirmation is
+# printed to the console only (so the user knows where to find it).
+
+if (!is.null(RUN_LOG_PATH) && sink.number() > 0) {
+  .run_log_end <- Sys.time()
+  .run_log_dur <- as.numeric(difftime(.run_log_end, .run_log_start, units = "secs"))
+
+  # Sum of per-plate elapsed times (excludes pre/post-processing overhead)
+  .plate_time_total <- sum(
+    summary_tbl$elapsed_s[summary_tbl$status == "processed"],
+    na.rm = TRUE
+  )
+  .overhead <- .run_log_dur - .plate_time_total
+
+  cat("\n", strrep("=", .pg_width), "\n", sep = "")
+  cat(" End of run log\n")
+  cat(strrep("-", .pg_width), "\n", sep = "")
+  cat(sprintf(" Finished       : %s\n", format(.run_log_end, "%Y-%m-%d %H:%M:%S")))
+  cat(sprintf(" Total duration : %.1fs\n",  .run_log_dur))
+  cat(sprintf(" Plate time     : %.1fs  (sum of per-plate elapsed times)\n", .plate_time_total))
+  cat(sprintf(" Overhead       : %.1fs  (file discovery, checks, logging)\n", .overhead))
+  cat(sprintf(" Log file       : %s\n",    RUN_LOG_PATH))
+  cat(strrep("=", .pg_width), "\n", sep = "")
+
+  sink(type = "output")   # detach sink — output returns to console only
+  close(.run_log_con)
+  cat(sprintf("\n  Run log saved to: %s\n", RUN_LOG_PATH))
 }
