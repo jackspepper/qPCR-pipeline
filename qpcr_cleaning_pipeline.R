@@ -27,14 +27,14 @@
 # to edit anything outside Sections 1 and 2.
 
 # --- Input ---
-INPUT_DIR    <- "data_raw/"   # Folder containing plate CSV files.
+INPUT_DIR    <- "RawData/"   # Folder containing plate CSV files.
 FILE_PATTERN <- "\\.csv$"    # Regex: which files to include (matched against filename).
 FILES        <- NULL         # Optional: explicit character vector of file paths.
 # If set, INPUT_DIR, FILE_PATTERN, and SEARCH_DEPTH
 # are all ignored.
 # e.g. FILES <- c("data_raw/plate1.csv", "data_raw/plate2.csv")
 
-SEARCH_DEPTH <- 0            # How many subfolder levels to search within INPUT_DIR.
+SEARCH_DEPTH <- 2            # How many subfolder levels to search within INPUT_DIR.
 #   0 = only files directly inside INPUT_DIR
 #   1 = INPUT_DIR + one level of subfolders
 #   2 = INPUT_DIR + two levels of subfolders, etc.
@@ -162,6 +162,8 @@ TARGET_LOD <- list(
 
 library(tidyverse)
 options(dplyr.show_progress = FALSE)
+options(readr.show_progress = FALSE)
+options(vroom.show_progress = FALSE)
 
 # ============================================================
 # SECTION 4: Internal Utility Helpers
@@ -208,7 +210,7 @@ write_csv_retry <- function(x, file, append = FALSE,
     attempt <- attempt + 1
     result  <- tryCatch(
       {
-        write_csv(x, file, append = append, ...)
+        write_csv(x, file, append = append, progress = FALSE, ...)
         "ok"
       },
       error = function(e) e
@@ -383,7 +385,8 @@ emit_file_tree <- function(tree_lines, output_mode, tree_path) {
 check_plate_standards <- function(file, n_expected) {
   tryCatch({
     raw_full <- read_csv(file, show_col_types = FALSE, col_names = FALSE,
-                         col_types = cols(.default = col_character()))
+                         col_types = cols(.default = col_character()),
+                         progress = FALSE)
     well_row <- which(raw_full[[1]] == "Well")
 
     if (length(well_row) == 0)
@@ -530,7 +533,7 @@ log_standard_check <- function(file, n_expected, check_result, action,
     lod_override       = lod_str,
     notes              = as.character(notes %||% NA_character_),
     source             = "R_script",
-    version            = "0.1.9"
+    version            = "0.1.10"
   )
   write_csv_retry(entry, std_log_path, append = TRUE)
   invisible(entry)
@@ -634,6 +637,8 @@ ask_standards_action <- function(failing_info, n_expected, std_force_lod) {
   for (fi in failing_info) {
     stem_label <- file_stem(fi$file)
     cat(sprintf("  --- %s ---\n", stem_label))
+    cat(sprintf("      Found   : %s\n", paste(fi$found,   collapse = ", ")))
+    cat(sprintf("      Missing : %s\n\n", paste(fi$missing,   collapse = ", ")))
 
     if (length(fi$targets) == 0) {
       cat("  Warning: no targets found in this plate.\n")
@@ -886,7 +891,7 @@ log_decision <- function(sample_id, target, rule_id, outcome, evidence,
     outcome    = outcome,
     evidence   = evidence,
     source     = "R_script",
-    version    = "0.1.9"
+    version    = "0.1.10"
   )
   write_csv_retry(entry, dec_log_path, append = TRUE)
   invisible(entry)
@@ -990,7 +995,7 @@ log_variables <- function(vars, run_id, var_log_path, default_file,
     var_value  = var_values,
     var_class  = var_class,
     source     = "R_script",
-    version    = "0.1.9"
+    version    = "0.1.10"
   )
 
   write_csv_retry(entry, var_log_path, append = TRUE)
@@ -1068,7 +1073,8 @@ process_plate <- function(file,
   pg_step_start(0, "Import — locating header row")
 
   raw_full  <- read_csv(file, show_col_types = FALSE, col_names = FALSE,
-                        col_types = cols(.default = col_character()))
+                        col_types = cols(.default = col_character()),
+                        progress = FALSE)
   well_row  <- which(raw_full[[1]] == "Well")
 
   if (length(well_row) == 0) {
@@ -1976,7 +1982,7 @@ if (nrow(timing_tbl) > 0) {
 # showing how many times each rule fired per file.
 
 if (file.exists(DEC_LOG_PATH)) {
-  audit <- read_csv(DEC_LOG_PATH, show_col_types = FALSE)
+  audit <- read_csv(DEC_LOG_PATH, show_col_types = FALSE, progress = FALSE)
 
   cat("\n--- 30 most recent audit decisions ---\n")
   print(audit |> arrange(desc(timestamp)) |> head(30))
