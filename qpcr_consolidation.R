@@ -25,7 +25,7 @@
 #    install.packages(c("tidyverse", "openxlsx"))
 # ============================================================
 
-version_script <- 0.1.1
+SCRIPT_VERSION <- 0.1.2
 
 # ============================================================
 # SECTION 1: Configuration
@@ -105,6 +105,11 @@ library(openxlsx)
 options(dplyr.show_progress = FALSE)
 options(readr.show_progress = FALSE)
 options(vroom.show_progress = FALSE)
+# Promote warnings to errors.  This ensures that advisory warnings (e.g.
+# openxlsx's transient unzip notice on temp-file cleanup) cause a clean,
+# visible stop rather than silently passing through.  Any genuine issue
+# that would otherwise appear as a warning will now halt the script at
+# the point it occurs, making diagnosis straightforward.
 options(warn = 2)
 
 
@@ -405,7 +410,7 @@ if (!is.null(CONSOLIDATION_LOG_PATH)) {
   cat(sprintf(" Input    : %s\n", INPUT_DIR))
   cat(sprintf(" All out  : %s\n", ALL_OUT_PATH))
   cat(sprintf(" Review   : %s\n", REVIEW_OUT_PATH))
-  cat(sprintf(" Version  : %s\n", version_script))
+  cat(sprintf(" Version  : %s\n", SCRIPT_VERSION))
   cat(strrep("=", .pg_width), "\n\n", sep = "")
 }
 
@@ -853,15 +858,16 @@ build_workbook <- function(data, wb_label) {
     freezePane(wb, sheet = sn, firstRow = TRUE)
 
     # Auto-fit column widths with a minimum floor.
-    # Guard against all-NA columns: nchar(NA) -> NA, so max(..., na.rm=TRUE)
-    # on a fully-NA vector returns -Inf and warns.  Replace that with 0 so
-    # the column falls through to COL_WIDTH_MIN cleanly.
+    # Strip NAs from the character-length vector before calling max() so
+    # that fully-NA columns (e.g. Review Reason on a clean plate) never
+    # produce a "no non-missing arguments" warning — which warn=2 would
+    # promote to a hard error before any suppression could intercept it.
     col_widths <- pmax(
       COL_WIDTH_MIN,
       vapply(names(tgt_data), function(cn) {
-        vals     <- nchar(as.character(head(tgt_data[[cn]], 100)))
-        content_w <- suppressWarnings(max(vals, na.rm = TRUE))
-        if (!is.finite(content_w)) content_w <- 0
+        vals      <- nchar(as.character(head(tgt_data[[cn]], 100)))
+        vals      <- vals[!is.na(vals)]
+        content_w <- if (length(vals) > 0) max(vals) else 0L
         max(nchar(cn), content_w)
       }, numeric(1))
     )
