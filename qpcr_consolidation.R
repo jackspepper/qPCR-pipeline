@@ -25,7 +25,7 @@
 #    install.packages(c("tidyverse", "openxlsx"))
 # ============================================================
 
-SCRIPT_VERSION <- 0.1.2
+SCRIPT_VERSION <- "0.2.0"
 
 # ============================================================
 # SECTION 1: Configuration
@@ -74,7 +74,7 @@ WAIT_SECS       <- 3   # Seconds to wait between retry attempts.
 # To add a new alias group, add another entry following the same pattern.
 # To disable alias mapping entirely, set TARGET_ALIASES <- list()
 TARGET_ALIASES <- list(
-  uni = c("uni", "universal")
+  uni = c("uni", "universal", "univ")
   # Add further groups as needed, e.g.:
   # speb = c("speb", "spec_b", "specb")
 )
@@ -88,6 +88,14 @@ TARGET_ALIASES <- list(
 #           keep "universal" or "uni" as written, but both land on the
 #           same sheet)
 UPDATE_TARGET_TO_CANONICAL <- TRUE
+
+# --- Audit directory ---
+# Location of the audit/ folder written by the cleaning pipeline.
+# Used to read the decision log and standards log for the run_summary sheet.
+# Defaults to "audit/" relative to the working directory; change if your
+# audit files live elsewhere (e.g. a shared network path).
+# Set to NULL to skip the audit summary entirely.
+AUDIT_DIR <- "audit/"
 
 # --- Run log ---
 # Plain-text transcript of all console output for this run.
@@ -105,13 +113,27 @@ library(openxlsx)
 options(dplyr.show_progress = FALSE)
 options(readr.show_progress = FALSE)
 options(vroom.show_progress = FALSE)
-# Promote warnings to errors.  This ensures that advisory warnings (e.g.
-# openxlsx's transient unzip notice on temp-file cleanup) cause a clean,
-# visible stop rather than silently passing through.  Any genuine issue
-# that would otherwise appear as a warning will now halt the script at
-# the point it occurs, making diagnosis straightforward.
-options(warn = 2)
 
+# Runtime dependency version guards (REC-05).
+# Catches silent failures from older package versions lacking required functions.
+local({
+  need <- list(dplyr = "1.1.0", tidyr = "1.3.0", purrr = "1.0.0",
+               readr = "2.0.0", stringr = "1.5.0", openxlsx = "4.2.0")
+  for (pkg in names(need)) {
+    ver <- tryCatch(packageVersion(pkg), error = function(e) NULL)
+    if (is.null(ver))
+      stop(pkg, " is not installed. Run: install.packages(c('tidyverse','openxlsx'))",
+           call. = FALSE)
+    if (ver < need[[pkg]])
+      stop(pkg, " >= ", need[[pkg]], " required (installed: ", ver, ").\n",
+           "  Run: install.packages(c('tidyverse','openxlsx'))", call. = FALSE)
+  }
+})
+# NOTE (RISK-05): build_decision_summary() and build_standards_summary() both
+# filter audit rows to the most recent run_id using lexicographic max().
+# This works because plate-level run_ids ("YYYYMMDD_HHMMSS_<stem>") are always
+# lexicographically greater than session-level ids ("SESSION_YYYYMMDD_HHMMSS").
+# If the run_id format changes this assumption must be revisited.
 
 # ============================================================
 # SECTION 3: Utility Helpers
@@ -199,6 +221,306 @@ pb_done <- function(pb) {
 
 
 # ----------------------------------------------------------
+# build_decision_summary
+#
+# Reads the cleaning pipeline's decision log from AUDIT_DIR,
+# filters to the most recent run_id per plate, then pivots to
+# a wide table with plate stems as rows and rule_ids as columns
+# (counts as values, 0 where a rule did not fire).
+#
+# Returns NULL (with a console warning) if the log cannot be
+# found or read.
+# ----------------------------------------------------------
+build_decision_summary <- function(audit_dir) {
+  if (is.null(audit_dir)) return(NULL)
+
+  dec_files <- list.files(audit_dir, pattern = "pcr_decisions.*\\.csv$",
+                          full.names = TRUE)
+  if (length(dec_files) == 0) {
+    report("!", "No decision log found in AUDIT_DIR — decision breakdown omitted from run_summary")
+    return(NULL)
+  }
+  # If multiple files exist, use the most recently modified
+  dec_file <- dec_files[which.max(file.info(dec_files)$mtime)]
+  report("+", sprintf("Decision log : %s", basename(dec_file)))
+
+  dec <- tryCatch(
+    read_csv(dec_file, show_col_types = FALSE, progress = FALSE,
+             col_types = cols(.default = col_character())),
+    error = function(e) {
+      report("x", sprintf("Could not read decision log: %s", conditionMessage(e)))
+      NULL
+    }
+  )
+  if (is.null(dec) || nrow(dec) == 0) return(NULL)
+
+  # Most recent run_id per input_file (run_id is YYYYMMDD_HHMMSS_<stem>,
+  # so lexicographic max is chronologically most recent)
+  dec_recent <- dec |>
+    group_by(input_file) |>
+    filter(run_id == max(run_id)) |>
+    ungroup()
+
+  dec_recent |>
+    mutate(plate = sub("\\.csv$", "", input_file, ignore.case = TRUE)) |>
+    count(plate, rule_id) |>
+    pivot_wider(names_from = rule_id, values_from = n, values_fill = 0L) |>
+    arrange(plate)
+}
+
+
+# ----------------------------------------------------------
+# build_standards_summary
+#
+# Reads the cleaning pipeline's standards log from AUDIT_DIR,
+# filters to the most recent run_id per plate, and returns a
+# tidy table showing each plate's action (pass/skipped/forced),
+# any missing standards, LOD overrides (for forced plates),
+# and notes.
+#
+# Returns NULL if the log cannot be found or read.
+# ----------------------------------------------------------
+build_standards_summary <- function(audit_dir) {
+  if (is.null(audit_dir)) return(NULL)
+
+  std_files <- list.files(audit_dir, pattern = "pcr_standards.*\\.csv$",
+                          full.names = TRUE)
+  if (length(std_files) == 0) {
+    report("!", "No standards log found in AUDIT_DIR — standards summary omitted from run_summary")
+    return(NULL)
+  }
+  std_file <- std_files[which.max(file.info(std_files)$mtime)]
+  report("+", sprintf("Standards log: %s", basename(std_file)))
+
+  std <- tryCatch(
+    read_csv(std_file, show_col_types = FALSE, progress = FALSE,
+             col_types = cols(.default = col_character())),
+    error = function(e) {
+      report("x", sprintf("Could not read standards log: %s", conditionMessage(e)))
+      NULL
+    }
+  )
+  if (is.null(std) || nrow(std) == 0) return(NULL)
+
+  std |>
+    group_by(input_file) |>
+    filter(run_id == max(run_id)) |>
+    ungroup() |>
+    mutate(plate = sub("\\.csv$", "", input_file, ignore.case = TRUE)) |>
+    select(plate, action, missing_standards, lod_override, notes) |>
+    arrange(plate)
+}
+
+
+# ----------------------------------------------------------
+# build_count_pivot
+#
+# Builds a plate x target count table from a data frame that
+# is already in memory (all_data or review_data).  Uses
+# .sheet_target (canonical name after alias resolution) as the
+# column axis so counts align with the sheet tabs.
+#
+# Plate# is kept numeric for sorting, then converted to
+# character; NA plate numbers are shown as "Unknown".
+# Zero-fills missing plate/target combinations.
+#
+# Returns NULL if `data` has zero rows.
+# ----------------------------------------------------------
+build_count_pivot <- function(data) {
+  if (is.null(data) || nrow(data) == 0) return(NULL)
+
+  sheet_col <- if (".sheet_target" %in% names(data)) ".sheet_target" else "Target"
+
+  data |>
+    mutate(
+      plate_sort = `Plate#`,   # retain numeric for sorting before stringify
+      `Plate#`   = if_else(is.na(`Plate#`), "Unknown", as.character(`Plate#`))
+    ) |>
+    count(`Plate#`, plate_sort, .data[[sheet_col]]) |>
+    rename(Target = all_of(sheet_col)) |>
+    pivot_wider(names_from = Target, values_from = n, values_fill = 0L) |>
+    arrange(plate_sort, `Plate#`) |>
+    select(-plate_sort)
+}
+
+
+# ----------------------------------------------------------
+# add_summary_sheet
+#
+# Inserts a "run_summary" sheet as the FIRST sheet of the
+# workbook containing four stacked labelled tables:
+#
+#   1. Decision Breakdown      — plate x rule_id counts
+#   2. Standards Check Results — plate-level action + LOD info
+#   3. Final Sample Counts     — plate x target (all_data)
+#   4. Review Sample Counts    — plate x target (review_data)
+#
+# Tables with no data are replaced by a single "(no data)"
+# notice row.  A 2-row gap and bold section-header row
+# separate each table.
+#
+# Args:
+#   wb            : openxlsx Workbook (target sheets already added)
+#   decision_wide : output of build_decision_summary(), or NULL
+#   standards_tbl : output of build_standards_summary(), or NULL
+#   all_counts    : output of build_count_pivot(all_data), or NULL
+#   review_counts : output of build_count_pivot(review_data), or NULL
+# ----------------------------------------------------------
+add_summary_sheet <- function(wb, decision_wide, standards_tbl,
+                              all_counts, review_counts) {
+
+  sn <- "run_summary"
+  addWorksheet(wb, sheetName = sn)
+
+  # ---- Styles ----
+  section_style <- createStyle(
+    fontName       = FONT_NAME,
+    fontSize       = FONT_SIZE + 1L,
+    textDecoration = "bold",
+    fgFill         = "#B8CCE4",          # light steel blue
+    border         = "Bottom",
+    borderColour   = "#2E5F8A"
+  )
+  header_style <- createStyle(
+    fontName       = FONT_NAME,
+    fontSize       = FONT_SIZE,
+    textDecoration = "bold",
+    fgFill         = "#4472C4",          # medium blue
+    fontColour     = "#FFFFFF"
+  )
+  data_style <- createStyle(
+    fontName = FONT_NAME,
+    fontSize = FONT_SIZE
+  )
+  int_style <- createStyle(
+    fontName = FONT_NAME,
+    fontSize = FONT_SIZE,
+    numFmt   = "0"
+  )
+  notice_style <- createStyle(
+    fontName      = FONT_NAME,
+    fontSize      = FONT_SIZE,
+    fontColour    = "#7F7F7F",
+    textDecoration = "italic"
+  )
+
+  current_row <- 1L
+
+  # ----------------------------------------------------------
+  # write_block: writes one titled table starting at current_row.
+  # Returns the next available row (after a 2-row gap).
+  # ----------------------------------------------------------
+  write_block <- function(title, tbl, numeric_cols = character(0)) {
+
+    # Section header spanning full width
+    writeData(wb, sn, x = title,
+              startRow = current_row, startCol = 1L, colNames = FALSE)
+    addStyle(wb, sn, style = section_style,
+             rows = current_row, cols = 1L, stack = FALSE)
+
+    data_start <- current_row + 1L
+
+    if (is.null(tbl) || nrow(tbl) == 0) {
+      writeData(wb, sn, x = "(no data available)",
+                startRow = data_start, startCol = 1L, colNames = FALSE)
+      addStyle(wb, sn, style = notice_style,
+               rows = data_start, cols = 1L, stack = FALSE)
+      return(data_start + 3L)   # title + notice + 2-row gap
+    }
+
+    # Header row
+    writeData(wb, sn, x = tbl,
+              startRow = data_start, startCol = 1L,
+              colNames = TRUE, keepNA = FALSE, na.string = "")
+    addStyle(wb, sn, style = header_style,
+             rows = data_start,
+             cols = seq_len(ncol(tbl)),
+             stack = FALSE)
+
+    # Data rows
+    n_data <- nrow(tbl)
+    data_rows <- (data_start + 1L):(data_start + n_data)
+    addStyle(wb, sn, style = data_style,
+             rows = data_rows,
+             cols = seq_len(ncol(tbl)),
+             gridExpand = TRUE, stack = FALSE)
+
+    # Integer formatting for specified columns
+    for (nc in intersect(numeric_cols, names(tbl))) {
+      col_idx <- which(names(tbl) == nc)
+      addStyle(wb, sn, style = int_style,
+               rows = data_rows, cols = col_idx,
+               gridExpand = TRUE, stack = TRUE)
+    }
+
+    data_start + n_data + 3L   # header + data + 2-row gap
+  }
+
+  # Derive integer column names for count tables (everything except Plate#)
+  count_int_cols <- function(tbl) {
+    if (is.null(tbl)) return(character(0))
+    setdiff(names(tbl), "Plate#")
+  }
+
+  # Derive integer column names for decision table (everything except plate)
+  dec_int_cols <- function(tbl) {
+    if (is.null(tbl)) return(character(0))
+    setdiff(names(tbl), "plate")
+  }
+
+  current_row <- write_block(
+    "1. Decision Breakdown  (most recent run per plate — counts by rule)",
+    decision_wide,
+    numeric_cols = dec_int_cols(decision_wide)
+  )
+  current_row <- write_block(
+    "2. Standards Check Results  (most recent run per plate)",
+    standards_tbl
+  )
+  current_row <- write_block(
+    "3. Final Sample Counts  (all_samples — by Plate# and Target)",
+    all_counts,
+    numeric_cols = count_int_cols(all_counts)
+  )
+  current_row <- write_block(
+    "4. Review Sample Counts  (review_samples — by Plate# and Target)",
+    review_counts,
+    numeric_cols = count_int_cols(review_counts)
+  )
+
+  # ---- Column widths ----
+  # All four tables start at column 1, so widths are set once for the widest
+  # table. For each column position we take the maximum header-name length
+  # across all tables that reach that position, then apply the minimum floor.
+  # This replaces the old approach (unique header names in arbitrary order)
+  # which assigned widths to positions that had no relationship to their content.
+  all_tbls  <- Filter(Negate(is.null), list(decision_wide, standards_tbl,
+                                             all_counts, review_counts))
+  max_cols  <- if (length(all_tbls) > 0L)
+    max(vapply(all_tbls, ncol, integer(1L)))
+  else 1L
+
+  col_widths <- vapply(seq_len(max_cols), function(j) {
+    # Collect header names at position j from every table that is wide enough
+    hdrs <- vapply(all_tbls, function(tbl) {
+      if (ncol(tbl) >= j) nchar(names(tbl)[[j]]) else 0L
+    }, integer(1L))
+    max(COL_WIDTH_MIN, max(hdrs))
+  }, numeric(1L))
+
+  setColWidths(wb, sn,
+               cols   = seq_len(max_cols),
+               widths = col_widths)
+
+  # ---- Move run_summary to sheet position 1 ----
+  n_sheets <- length(wb$worksheets)
+  worksheetOrder(wb) <- c(n_sheets, seq_len(n_sheets - 1L))
+
+  invisible(wb)
+}
+
+
+# ----------------------------------------------------------
 # save_workbook_retry
 #
 # Wraps openxlsx::saveWorkbook() with automatic retry on
@@ -220,7 +542,18 @@ save_workbook_retry <- function(wb, path,
   repeat {
     attempt <- attempt + 1
     result  <- tryCatch({
-      saveWorkbook(wb, file = path, overwrite = overwrite)
+      # Suppress the transient openxlsx unzip notice that fires on temp-file
+      # cleanup — it is advisory-only and carries no data-loss risk.
+      # All other warnings are left unaffected (not promoted to errors).
+      withCallingHandlers(
+        saveWorkbook(wb, file = path, overwrite = overwrite),
+        warning = function(w) {
+          if (grepl("unzip|cannot unzip|temp", conditionMessage(w),
+                    ignore.case = TRUE, perl = TRUE))
+            invokeRestart("muffleWarning")
+          # Any other warning propagates normally
+        }
+      )
       "ok"
     }, error = function(e) e)
 
@@ -258,26 +591,62 @@ parse_filename <- function(fname) {
   stem <- sub("\\.csv$", "", basename(fname), ignore.case = TRUE)
 
   # --- Date ---
-  date_raw <- regmatches(stem, regexpr("^(\\d{8}|\\d{6})", stem))
-  parsed_date <- if (length(date_raw) == 1L && nchar(date_raw) > 0L) {
-    fmt <- if (nchar(date_raw) == 6L) "%y%m%d" else "%Y%m%d"
-    tryCatch(
-      format(as.Date(date_raw, format = fmt), "%Y-%m-%d"),
-      error = function(e) NA_character_
-    )
+  # Matches YYYYMMDD (8 digits), YYMMDD (6 digits), or separator-delimited
+  # variants at the start of the filename stem followed by an underscore.
+  m <- regexec(
+    "^((?:\\d{8}|\\d{6}|\\d{4}[-/]\\d{2}[-/]\\d{2}|\\d{2}[-/]\\d{2}[-/]\\d{4}))_",
+    stem
+  )
+  res <- regmatches(stem, m)[[1]]
+
+  date_raw <- if (length(res) >= 2) res[2] else NA_character_
+
+  # Try all known formats.
+  # Format list is chosen based on the width of date_raw so that a 6-digit
+  # string (YYMMDD) is always tried against %y%m%d before %Y%m%d.
+  # Without this guard, as.Date("241225", "%Y%m%d") succeeds and returns
+  # the year 0024 rather than 2024, because R does not enforce field widths.
+  parsed_date <- if (!is.na(date_raw) && nzchar(date_raw)) {
+    fmts <- if (nchar(date_raw) == 6L)
+      c("%y%m%d", "%d%m%y")
+    else
+      c("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y")
+    parsed <- NA_character_   # character NA so parsed_date is always character type
+
+    for (fmt in fmts) {
+      try({
+        tmp <- as.Date(date_raw, format = fmt)
+        if (!is.na(tmp)) {
+          parsed <- format(tmp, "%Y-%m-%d")
+          break
+        }
+      }, silent = TRUE)
+    }
+
+    parsed
   } else {
     NA_character_
   }
 
-  # --- Plate number ---
-  plate_raw <- regmatches(
-    stem,
-    regexpr("(?i)plate(\\d+)", stem, perl = TRUE)
-  )
-  plate_num <- if (length(plate_raw) == 1L && nchar(plate_raw) > 0L) {
-    suppressWarnings(as.integer(
-      sub("(?i)^plate", "", plate_raw, perl = TRUE)
-    ))
+  # --- Plate number (bulletproof) ---
+  plate_pattern <- "(?ix)
+  plate              # literal word 'plate' (case-insensitive)
+  \\s*               # optional whitespace
+  (?:                # optional separators or qualifiers
+      [#:_-]?        # optional punctuation (#, :, _, -, or nothing)
+      \\s*           # optional whitespace
+      (?:no|num|number)?  # optional 'no' / 'num' / 'number'
+      \\.?           # optional dot after 'no.'
+      \\s*           # optional whitespace
+  )?
+  (\\d{1,3})         # capture the plate number (1–3 digits)
+"
+
+  plate_match <- regexec(plate_pattern, stem, perl = TRUE)
+  pm <- regmatches(stem, plate_match)[[1]]
+
+  plate_num <- if (length(pm) >= 2) {
+    as.integer(pm[2])
   } else {
     NA_integer_
   }
@@ -305,22 +674,28 @@ fmt_size <- function(bytes) {
 # ----------------------------------------------------------
 # wb_stats
 # Returns a summary string for an existing xlsx workbook.
+# Wrapped in tryCatch so a locked or momentarily unreachable
+# network path returns a graceful notice rather than an error.
 # ----------------------------------------------------------
 wb_stats <- function(path) {
-  info       <- file.info(path)
-  sheet_nms  <- tryCatch(getSheetNames(path), error = function(e) character(0))
-  n_sheets   <- length(sheet_nms)
-  sheets_str <- if (n_sheets == 0) "(none)"
-  else paste(sheet_nms, collapse = ", ")
+  tryCatch({
+    info       <- file.info(path)
+    sheet_nms  <- tryCatch(getSheetNames(path), error = function(e) character(0))
+    n_sheets   <- length(sheet_nms)
+    sheets_str <- if (n_sheets == 0) "(none)"
+    else paste(sheet_nms, collapse = ", ")
 
-  sprintf(
-    "  Modified : %s\n  Size     : %s\n  Sheets   : %s (%d sheet%s)",
-    format(info$mtime, "%Y-%m-%d %H:%M:%S"),
-    fmt_size(info$size),
-    sheets_str,
-    n_sheets,
-    if (n_sheets == 1L) "" else "s"
-  )
+    sprintf(
+      "  Modified : %s\n  Size     : %s\n  Sheets   : %s (%d sheet%s)",
+      format(info$mtime, "%Y-%m-%d %H:%M:%S"),
+      fmt_size(info$size),
+      sheets_str,
+      n_sheets,
+      if (n_sheets == 1L) "" else "s"
+    )
+  }, error = function(e) {
+    sprintf("  (could not read file info: %s)", conditionMessage(e))
+  })
 }
 
 
@@ -468,7 +843,7 @@ cat(sprintf("  Found %d _review_samples file(s)\n", length(review_files)))
 # Canonical output column names and their source equivalents.
 # Source columns are as written by the cleaning pipeline.
 .OUT_COLS <- c(
-  "File Name", "Date", "Plate#",           # added by this script
+  "File Name", "Date", "Plate#", "Repeat#",           # added by this script
   "Well", "Fluor", "Target", "Content",
   "Sample", "Cq", "Starting Quantity (SQ)",
   "DeltaCq", "AverageSQ", "Review Reason"  # "review_reason" renamed
@@ -512,6 +887,26 @@ read_and_annotate <- function(files, label) {
       report("!", sprintf("No plate number found in filename: %s", basename(fp)))
     }
 
+    # --- Extract repeat number from filename ---
+    # perl = TRUE is required so that the inline (?i) case-insensitivity flag
+    # is honoured — R's default TRE engine silently ignores PCRE inline flags.
+    repeat_pattern <- "(?i)(rpt|rep|repeat)\\s*([0-9]*)"
+    rp             <- regexec(repeat_pattern, stem, perl = TRUE)
+    repeat_match   <- regmatches(stem, rp)[[1]]   # renamed from 'rm' to avoid shadowing base rm()
+
+    repeat_num <- NA_integer_
+
+    if (length(repeat_match) >= 2) {
+      # repeat_match[2] = rpt/rep/repeat keyword
+      # repeat_match[3] = the trailing number (if present)
+      if (nzchar(repeat_match[3])) {
+        repeat_num <- as.integer(repeat_match[3])
+      } else {
+        # Found keyword but no number — treat as repeat 1
+        repeat_num <- 1L
+      }
+    }
+
     # --- Read CSV ---
     dat <- tryCatch(
       read_csv(fp, show_col_types = FALSE, progress = FALSE,
@@ -551,6 +946,7 @@ read_and_annotate <- function(files, label) {
         `File Name` = basename(fp),
         `Date`      = meta$date,
         `Plate#`    = meta$plate_num,
+        `Repeat#`   = repeat_num,
         .before     = 1
       )
 
@@ -704,6 +1100,10 @@ load_existing_sheets <- function(path) {
     }
   )
 
+  # Exclude the run_summary sheet — it contains audit tables, not
+  # sample data, and cannot be bound with the target data sheets.
+  sheet_names <- sheet_names[sheet_names != "run_summary"]
+
   if (length(sheet_names) == 0) return(tibble())
 
   cat(sprintf("  Loading %d existing sheet(s) from %s...\n",
@@ -727,6 +1127,23 @@ load_existing_sheets <- function(path) {
       }
       if ("Plate#" %in% names(df))
         df[["Plate#"]] <- suppressWarnings(as.integer(df[["Plate#"]]))
+
+      # RISK-06: .sheet_target is dropped before writing to Excel, so it must
+      # be rebuilt here so build_workbook() can route rows to the right sheet.
+      # Re-apply alias resolution using the same TARGET_ALIASES as the current
+      # run (assumes aliases are stable between runs — documented in Section 1).
+      if (!".sheet_target" %in% names(df)) {
+        if (length(TARGET_ALIASES) > 0 && "Target" %in% names(df)) {
+          alias_lookup <- unlist(lapply(names(TARGET_ALIASES), function(cn) {
+            setNames(rep(cn, length(TARGET_ALIASES[[cn]])),
+                     tolower(TARGET_ALIASES[[cn]]))
+          }))
+          tgt_lower <- tolower(df$Target)
+          df$.sheet_target <- dplyr::coalesce(alias_lookup[tgt_lower], tgt_lower)
+        } else {
+          df$.sheet_target <- tolower(df$Target)
+        }
+      }
     }
     df
   })
@@ -735,13 +1152,45 @@ load_existing_sheets <- function(path) {
 }
 
 
-# If appending, merge existing data with newly read data
+# ----------------------------------------------------------
+# Helper: deduplicate a combined data frame after append.
+# Key: File Name + Well + Fluor + Target + Sample.
+# Keeps the first occurrence so existing rows take precedence
+# over re-reads of the same plate from the new data.
+# ----------------------------------------------------------
+.dedup_append <- function(combined, label) {
+  key_cols <- c("File Name", "Well", "Fluor", "Target", "Sample")
+  present  <- intersect(key_cols, names(combined))
+
+  if (length(present) < length(key_cols)) {
+    report("!", sprintf(
+      "%s: deduplication skipped — key column(s) missing: %s",
+      label, paste(setdiff(key_cols, present), collapse = ", ")
+    ))
+    return(combined)
+  }
+
+  n_before  <- nrow(combined)
+  combined  <- combined |> distinct(across(all_of(key_cols)), .keep_all = TRUE)
+  n_removed <- n_before - nrow(combined)
+
+  if (n_removed > 0)
+    report("~", sprintf(
+      "%s: removed %d duplicate row(s) after append (key: %s)",
+      label, n_removed, paste(key_cols, collapse = " + ")
+    ))
+
+  combined
+}
+
+
+# If appending, merge existing data with newly read data then deduplicate
 if (all_action$action == "append" && file.exists(all_action$out_path)) {
   existing_all <- load_existing_sheets(all_action$out_path)
   n_existing   <- nrow(existing_all)
-  all_data     <- bind_rows(existing_all, all_data)
+  all_data     <- .dedup_append(bind_rows(existing_all, all_data), "all_samples")
   report("~", sprintf(
-    "All-samples append: %d existing row(s) + %d new row(s) = %d total",
+    "All-samples append: %d existing row(s) + %d new row(s) = %d total (after dedup)",
     n_existing, nrow(all_data) - n_existing, nrow(all_data)
   ))
 }
@@ -749,12 +1198,59 @@ if (all_action$action == "append" && file.exists(all_action$out_path)) {
 if (review_action$action == "append" && file.exists(review_action$out_path)) {
   existing_review <- load_existing_sheets(review_action$out_path)
   n_existing      <- nrow(existing_review)
-  review_data     <- bind_rows(existing_review, review_data)
+  review_data     <- .dedup_append(bind_rows(existing_review, review_data), "review_samples")
   report("~", sprintf(
-    "Review-samples append: %d existing row(s) + %d new row(s) = %d total",
+    "Review-samples append: %d existing row(s) + %d new row(s) = %d total (after dedup)",
     n_existing, nrow(review_data) - n_existing, nrow(review_data)
   ))
 }
+
+
+# ============================================================
+# SECTION 7.5: Load Audit Data for run_summary Sheet
+# ============================================================
+# Reads the cleaning pipeline's decision log and standards log
+# from AUDIT_DIR.  Both are filtered to the most recent run_id
+# per plate so the summary reflects the same data that is in
+# the output CSVs (i.e. the last time each plate was processed).
+#
+# Count pivots for the sample/review tables are built directly
+# from all_data and review_data (already in memory).
+#
+# All four objects are passed to add_summary_sheet() later.
+# If AUDIT_DIR is NULL or a log is missing, the corresponding
+# table is omitted gracefully with a [!] console notice.
+# ============================================================
+
+cat(sprintf("\n%s\n", strrep("-", .pg_width)))
+cat(" Loading audit data for run_summary sheet\n")
+cat(strrep("-", .pg_width), "\n", sep = "")
+
+if (!is.null(AUDIT_DIR) && !dir.exists(AUDIT_DIR)) {
+  report("!", sprintf("AUDIT_DIR not found: '%s' — audit tables will be empty", AUDIT_DIR))
+  AUDIT_DIR <- NULL
+}
+
+.summary_decision  <- build_decision_summary(AUDIT_DIR)
+.summary_standards <- build_standards_summary(AUDIT_DIR)
+.summary_all_counts    <- build_count_pivot(all_data)
+.summary_review_counts <- build_count_pivot(review_data)
+
+report("+", sprintf("Decision breakdown : %s",
+                    if (is.null(.summary_decision)) "no data"
+                    else sprintf("%d plate(s) x %d rule(s)",
+                                 nrow(.summary_decision), ncol(.summary_decision) - 1L)))
+report("+", sprintf("Standards summary  : %s",
+                    if (is.null(.summary_standards)) "no data"
+                    else sprintf("%d plate(s)", nrow(.summary_standards))))
+report("+", sprintf("Final counts pivot : %s",
+                    if (is.null(.summary_all_counts)) "no data"
+                    else sprintf("%d plate(s) x %d target(s)",
+                                 nrow(.summary_all_counts), ncol(.summary_all_counts) - 1L)))
+report("+", sprintf("Review counts pivot: %s",
+                    if (is.null(.summary_review_counts)) "no data"
+                    else sprintf("%d plate(s) x %d target(s)",
+                                 nrow(.summary_review_counts), ncol(.summary_review_counts) - 1L)))
 
 
 # ============================================================
@@ -860,8 +1356,7 @@ build_workbook <- function(data, wb_label) {
     # Auto-fit column widths with a minimum floor.
     # Strip NAs from the character-length vector before calling max() so
     # that fully-NA columns (e.g. Review Reason on a clean plate) never
-    # produce a "no non-missing arguments" warning — which warn=2 would
-    # promote to a hard error before any suppression could intercept it.
+    # produce a "no non-missing arguments to max" warning.
     col_widths <- pmax(
       COL_WIDTH_MIN,
       vapply(names(tgt_data), function(cn) {
@@ -894,6 +1389,28 @@ wb_review <- build_workbook(review_data, "review-samples")
 
 
 # ----------------------------------------------------------
+# Prepend run_summary sheet to both workbooks
+# ----------------------------------------------------------
+cat(sprintf("\n%s\n", strrep("-", .pg_width)))
+cat(" Building run_summary sheet\n")
+cat(strrep("-", .pg_width), "\n", sep = "")
+
+add_summary_sheet(wb_all,
+                  decision_wide  = .summary_decision,
+                  standards_tbl  = .summary_standards,
+                  all_counts     = .summary_all_counts,
+                  review_counts  = .summary_review_counts)
+report("+", "run_summary sheet added to all-samples workbook")
+
+add_summary_sheet(wb_review,
+                  decision_wide  = .summary_decision,
+                  standards_tbl  = .summary_standards,
+                  all_counts     = .summary_all_counts,
+                  review_counts  = .summary_review_counts)
+report("+", "run_summary sheet added to review-samples workbook")
+
+
+# ----------------------------------------------------------
 # Write workbooks with retry
 # ----------------------------------------------------------
 cat(sprintf("\n%s\n", strrep("-", .pg_width)))
@@ -921,16 +1438,22 @@ cat(sprintf("\n%s\n", strrep("=", .pg_width)))
 cat(" Consolidation complete\n")
 cat(strrep("=", .pg_width), "\n", sep = "")
 
-# Per-target row count summary (printed for both workbooks)
+# Per-target row count summary (printed for both workbooks).
+# Uses .sheet_target (canonical sheet name) so the counts shown here
+# match the sheet tabs in the workbook, even when UPDATE_TARGET_TO_CANONICAL
+# is FALSE and the Target column still holds the original alias values.
 summarise_workbook <- function(data, label) {
   if (nrow(data) == 0) {
     cat(sprintf("\n  %s: no data\n", label))
     return(invisible(NULL))
   }
+  display_col <- if (".sheet_target" %in% names(data)) ".sheet_target" else "Target"
   tbl <- data |>
-    count(Target, name = "rows") |>
-    arrange(Target)
-  cat(sprintf("\n  %s — %d row(s) across %d target(s):\n",
+    mutate(.display = .data[[display_col]]) |>
+    count(.display, name = "rows") |>
+    rename(Sheet = .display) |>
+    arrange(Sheet)
+  cat(sprintf("\n  %s — %d row(s) across %d sheet(s):\n",
               label, nrow(data), nrow(tbl)))
   print(tbl, n = Inf)
 }

@@ -19,6 +19,7 @@
 #    install.packages("tidyverse")   # tidyverse >= 2.0 required
 # ============================================================
 
+SCRIPT_VERSION <- "0.2.0"
 
 # ============================================================
 # SECTION 1: Configuration
@@ -59,7 +60,7 @@ DELTA_CQ_THRESHOLD <- 1.0  # Max acceptable |Cq replicate difference|.
 # --- Optional: Remove rows whose sample/content values match a pattern ---
 # Any row where a value in RM_COLUMNS matches any pattern in RM_PATTERNS
 # will be removed. Matching is case-insensitive.
-RM_PATTERNS <- c("OM", "Std", "NTC", "Neg")  # Regex patterns to match.
+RM_PATTERNS <- c("Std", "NTC", "Neg")  # Regex patterns to match.
 RM_COLUMNS  <- c("sample")                    # Which columns to search in.
 
 # Set to TRUE to print a table of matched rows before removing them.
@@ -92,16 +93,28 @@ SKIP_COMPLETED <- TRUE
 # to skip them or force them through with manually specified LOD overrides.
 STD_CHECK_ENABLED <- TRUE   # Set to FALSE to bypass the check entirely.
 N_STANDARDS       <- 6      # How many standards to expect (Std-001 … Std-006).
+# Standards are split into Hi/Lo halves for LOD prompting:
+#   Hi half : Std-001 … Std-floor(N_STANDARDS/2)       — governs LOD Hi
+#   Lo half : Std-(floor(N_STANDARDS/2)+1) … Std-NNN   — governs LOD Lo
+# For even N this split is symmetric (e.g. N=6 → Hi:1-3, Lo:4-6).
+# For odd  N the Lo half is one standard larger (e.g. N=5 → Hi:1-2, Lo:3-5).
+# N_STANDARDS must be >= 2 for the Hi/Lo split to be well-defined.
 
 # Per-target LOD overrides for plates forced through the standards check.
 # Keys must be lowercase target names matching your CSV files.
 # Required in non-interactive sessions; also offered as defaults interactively.
 # Set to NULL to be prompted to enter every value manually each time.
+#
+# NOTE: the interactive prompt now collects ONE value per LOD boundary and
+# broadcasts it to all targets on the plate (because process_plate() requires
+# all targets to share the same LOD values).  The list keys below must still
+# name each target so the lookup succeeds, but all values within LOD_Hi (and
+# within LOD_Lo) should be identical.
 STD_FORCE_LOD <- NULL
 # Example:
 # STD_FORCE_LOD <- list(
-#   LOD_Hi = list(nuc = 2000, fucp = 2000),
-#   LOD_Lo = list(nuc = 0.012, fucp = 0.012)
+#   LOD_Hi = list(nuc = 2000, lyta = 2000, copb = 2000),  # all equal
+#   LOD_Lo = list(nuc = 0.012, lyta = 0.012, copb = 0.012)
 # )
 
 # Separate audit log that records the outcome of every standards check.
@@ -131,7 +144,12 @@ RUN_LOG_PATH <- "audit/pcr_run_log.txt"
 
 TARGET_LOD <- list(
   LOD_Hi = list(
-    fucp      = 2000,
+    hi_fucp   = 2000,
+    fucp   = 2000,
+    `hi-fucp` = 2000,
+    `hi fucp` = 2000,
+    hi_hpd3   = 2000,
+    `hi-hpd3` = 2000,
     hpd3      = 2000,
     lyta      = 2000,
     copb      = 2000,
@@ -139,10 +157,18 @@ TARGET_LOD <- list(
     nuc       = 2000,
     gyrb      = 2000,
     uni       = 200,
-    universal = 200
+    univ      = 200,
+    universal = 200,
+    hh_hpd3   = 2000,
+    hh_hypd   = 2000
   ),
   LOD_Lo = list(
-    fucp      = 0.012,
+    hi_fucp   = 0.012,
+    fucp   = 0.012,
+    `hi-fucp` = 0.012,
+    `hi fucp` = 0.012,
+    hi_hpd3   = 0.012,
+    `hi-hpd3` = 0.012,
     hpd3      = 0.012,
     lyta      = 0.012,
     copb      = 0.012,
@@ -150,8 +176,28 @@ TARGET_LOD <- list(
     nuc       = 0.012,
     gyrb      = 0.012,
     uni       = 0.0012,
-    universal = 0.0012
+    univ      = 0.0012,
+    universal = 0.0012,
+    hh_hpd3   = 0.012,
+    hh_hypd   = 0.012
   )
+)
+
+
+# Targets that are expected to always produce a detectable result.
+# If a replicate group for one of these targets has ALL replicates adjusted
+# to LOD_Lo / 2 (i.e. every replicate either had no Cq or an SQ below LOD_Lo),
+# it is flagged RV_UNEXPECTED_NEG and sent to the review CSV for investigation.
+#
+# Two sub-reasons are recorded to distinguish the cause:
+#   "No amplification"  — every Cq in the group is NA/NaN
+#   "Below LOD_Lo"      — Cq(s) present but all SQ values were < LOD_Lo
+#
+# Keys must be lowercase and match the target names in your CSV files.
+# Set to NULL or character(0) to disable the check entirely.
+ALWAYS_POSITIVE_TARGETS <- c("uni", "univ", "universal"
+  # Add targets that should always amplify, e.g.:
+  # "nuc", "lyta", "gyrb"
 )
 
 
@@ -164,6 +210,22 @@ library(tidyverse)
 options(dplyr.show_progress = FALSE)
 options(readr.show_progress = FALSE)
 options(vroom.show_progress = FALSE)
+
+# Runtime dependency version guards.
+# These catch silent failures caused by using an older package that lacks
+# functions called by this script (e.g. if_any, pick, across).
+local({
+  need <- list(dplyr = "1.1.0", tidyr = "1.3.0", purrr = "1.0.0",
+               readr = "2.0.0", stringr = "1.5.0")
+  for (pkg in names(need)) {
+    ver <- tryCatch(packageVersion(pkg), error = function(e) NULL)
+    if (is.null(ver))
+      stop(pkg, " is not installed. Run: install.packages('tidyverse')", call. = FALSE)
+    if (ver < need[[pkg]])
+      stop(pkg, " >= ", need[[pkg]], " required (installed: ", ver, ").\n",
+           "  Run: install.packages('tidyverse')", call. = FALSE)
+  }
+})
 
 # ============================================================
 # SECTION 4: Internal Utility Helpers
@@ -280,6 +342,8 @@ list_files_depth <- function(dir, pattern, depth) {
 #
 # Returns: character vector — one element per line of the rendered tree
 build_file_tree <- function(files, root_dir, depth_requested) {
+  # depth_requested may be NA_integer_ when FILES is supplied explicitly
+  # (search depth is irrelevant in that case); the header reflects this.
 
   norm     <- function(p) gsub("\\\\", "/", p)
   root     <- norm(root_dir)
@@ -289,9 +353,12 @@ build_file_tree <- function(files, root_dir, depth_requested) {
   rel          <- sort(sub(paste0("^", root_esc), "", norm(files)))
   depth_actual <- if (length(rel) > 0) max(nchar(gsub("[^/]", "", rel))) else 0
 
+  depth_str <- if (is.na(depth_requested)) "explicit FILES — depth N/A"
+               else sprintf("depth requested: %d", depth_requested)
+
   header <- sprintf(
-    "%s  [depth requested: %d | deepest file: %d level(s) | %d file(s) to process]",
-    basename(root_dir), depth_requested, depth_actual, length(files)
+    "%s  [%s | deepest file: %d level(s) | %d file(s) to process]",
+    basename(root_dir), depth_str, depth_actual, length(files)
   )
 
   if (length(files) == 0) {
@@ -364,6 +431,35 @@ emit_file_tree <- function(tree_lines, output_mode, tree_path) {
 # Standards check helpers
 # -------------------------------------------------------
 
+# Extracts the integer standard number from a label in any supported format.
+# Accepts "Std-001", "Std-01", "std-3", etc.
+# Returns NA_integer_ if the label does not parse.
+# Used internally by normalize_std_label() and classify_missing_standards().
+#
+# Args:
+#   s : character vector of one or more standard labels
+#
+# Returns: integer vector, same length as s
+std_label_to_num <- function(s) {
+  suppressWarnings(
+    as.integer(sub("(?i)^std-0*", "", s, perl = TRUE))
+  )
+}
+
+
+# Normalises a single standard label to canonical 3-digit form.
+# Accepts both abbreviated (Std-01) and canonical (Std-001) styles,
+# as well as any number of leading zeros.
+# Used by both check_plate_standards() and classify_missing_standards().
+#
+# Args:
+#   s : a single character label, e.g. "Std-01", "Std-001", "std-3"
+#
+# Returns: canonical form, e.g. "Std-001"
+normalize_std_label <- function(s) {
+  sprintf("Std-%03d", std_label_to_num(s))
+}
+
 # Reads a plate file and verifies that all expected Std-001 … Std-NNN entries
 # are present in the Content column.  Uses the same dynamic header detection
 # as process_plate() so results are consistent with what the pipeline will see.
@@ -412,18 +508,14 @@ check_plate_standards <- function(file, n_expected) {
     std_vals <- as.character(raw$content)
 
     # Detect standards in either Std-001 (3-digit) or Std-01 (2-digit) format.
+    # The pattern allows up to 6 digits so N_STANDARDS can safely exceed 99.
     std_present_raw <- sort(unique(std_vals[str_detect(std_vals,
-                                                       regex("^Std-0{0,2}[1-9]\\d?$",
+                                                       regex("^Std-\\d{1,6}$",
                                                              ignore_case = TRUE))]))
 
     # Normalise all found labels to canonical 3-digit form (Std-001) so that
     # both "Std-01" and "Std-001" resolve identically during the missing check.
-    normalize_std_label <- function(s) {
-      num <- suppressWarnings(
-        as.integer(sub("(?i)^std-0*", "", s, perl = TRUE))
-      )
-      sprintf("Std-%03d", num)
-    }
+    # normalize_std_label() is defined as a top-level helper above.
     std_present_norm <- if (length(std_present_raw) > 0)
       vapply(std_present_raw, normalize_std_label, character(1), USE.NAMES = FALSE)
     else
@@ -533,56 +625,486 @@ log_standard_check <- function(file, n_expected, check_result, action,
     lod_override       = lod_str,
     notes              = as.character(notes %||% NA_character_),
     source             = "R_script",
-    version            = "0.1.10"
+    version            = SCRIPT_VERSION
   )
   write_csv_retry(entry, std_log_path, append = TRUE)
   invisible(entry)
 }
 
 
+# -------------------------------------------------------
+# classify_missing_standards()
+# -------------------------------------------------------
+# Classifies the missing-standard pattern for a single failing plate.
+# Used by ask_standards_action() to route each plate to the correct
+# prompt path.
+#
+# End standards : Std-001 (LOD Hi endpoint) and Std-NNN (LOD Lo endpoint).
+# Hi half       : Std-001 … Std-floor(N/2)   — missing ones affect LOD Hi.
+# Lo half       : Std-(floor(N/2)+1) … Std-NNN — missing ones affect LOD Lo.
+# Middle        : any standard that is NOT Std-001 or Std-NNN.
+#
+# Classification:
+#   "middle_1_2"  — both endpoints present; 1–2 interior standards absent.
+#   "middle_3plus"— both endpoints present; 3 or more interior standards absent.
+#   "end_missing" — at least one endpoint (Std-001 or Std-NNN) is absent.
+#
+# Args:
+#   missing    : character vector of canonical missing labels (e.g. "Std-001")
+#   n_expected : N_STANDARDS
+#
+# Returns a named list with logical / integer / character fields.
+classify_missing_standards <- function(missing, n_expected) {
+
+  if (n_expected < 2L) {
+    warning(
+      "N_STANDARDS is ", n_expected, " — Hi/Lo half split requires at least 2 standards. ",
+      "Both LOD_Hi and LOD_Lo will be prompted for all affected plates.",
+      call. = FALSE
+    )
+    # Treat the single standard as belonging to both halves so both LODs are asked.
+    return(list(
+      hi_endpoint_missing  = any(grepl("Std-001", missing, ignore.case = TRUE)),
+      lo_endpoint_missing  = any(grepl(sprintf("Std-%03d", n_expected), missing,
+                                       ignore.case = TRUE)),
+      n_missing_middle     = 0L,
+      missing_middle_stds  = character(0),
+      missing_hi_half      = length(missing) > 0L,
+      missing_lo_half      = length(missing) > 0L,
+      needs_both_lods      = length(missing) > 0L,
+      needs_hi_only        = FALSE,
+      needs_lo_only        = FALSE,
+      type                 = "end_missing"
+    ))
+  }
+
+  hi_nums <- seq_len(floor(n_expected / 2L))
+  lo_nums <- seq.int(floor(n_expected / 2L) + 1L, n_expected)
+
+  missing_nums <- std_label_to_num(missing)
+  missing_nums <- sort(missing_nums[!is.na(missing_nums)])
+
+  hi_endpoint_missing <- 1L         %in% missing_nums
+  lo_endpoint_missing <- n_expected %in% missing_nums
+
+  # Middle = every standard except the first and last
+  middle_range     <- seq_len(n_expected)
+  middle_range     <- middle_range[middle_range != 1L & middle_range != n_expected]
+  missing_mid_nums <- intersect(missing_nums, middle_range)
+
+  missing_hi_half <- any(missing_nums %in% hi_nums)
+  missing_lo_half <- any(missing_nums %in% lo_nums)
+
+  type <- if (hi_endpoint_missing || lo_endpoint_missing) {
+    "end_missing"
+  } else if (length(missing_mid_nums) > 2L) {
+    "middle_3plus"
+  } else {
+    "middle_1_2"
+  }
+
+  list(
+    hi_endpoint_missing  = hi_endpoint_missing,
+    lo_endpoint_missing  = lo_endpoint_missing,
+    n_missing_middle     = length(missing_mid_nums),
+    missing_middle_stds  = sprintf("Std-%03d", missing_mid_nums),
+    missing_hi_half      = missing_hi_half,
+    missing_lo_half      = missing_lo_half,
+    needs_both_lods      = missing_hi_half && missing_lo_half,
+    needs_hi_only        = missing_hi_half && !missing_lo_half,
+    needs_lo_only        = !missing_hi_half && missing_lo_half,
+    type                 = type,
+    hi_nums              = hi_nums,   # exposed so ask_standards_action need not recompute
+    lo_nums              = lo_nums    # exposed so ask_standards_action need not recompute
+  )
+}
+
+
+# -------------------------------------------------------
+# .collect_lod_for_plate()
+# -------------------------------------------------------
+# Interactively collects LOD Hi and/or LOD Lo overrides for one plate.
+#
+# process_plate() enforces that every target on a plate must share the same
+# LOD_Hi value AND the same LOD_Lo value (it hard-stops if they differ).
+# Therefore a SINGLE value is collected here and broadcast to every target,
+# keeping the returned list structure compatible with process_plate().
+#
+# Inference (Y/N fast-path):
+#   LOD Hi is inferred (Y/N confirmation) when Std-001 IS present.
+#   LOD Lo is inferred (Y/N confirmation) when Std-NNN IS present.
+#   If the corresponding endpoint is MISSING, manual entry is always required.
+#
+# Reference values are taken from the first target found in TARGET_LOD.
+# Because all targets on a plate must have equal LODs in TARGET_LOD for the
+# pipeline to accept them, using any one target gives the correct reference.
+#
+# For a LOD that is unaffected (ask_hi / ask_lo = FALSE) the TARGET_LOD value
+# is carried through automatically so the returned list is always fully
+# populated for process_plate().
+#
+# Args:
+#   fi            : one failing_info element ($file, $targets, …)
+#   cls           : result of classify_missing_standards() for this plate
+#   target_lod    : TARGET_LOD (Section 2) — shown as "normal" reference
+#   std_force_lod : STD_FORCE_LOD (Section 1) — used as manual-entry defaults
+#   n_expected    : N_STANDARDS
+#   ask_hi / ask_lo     : whether to prompt for that LOD at all
+#   infer_hi / infer_lo : TRUE → Y/N fast-path; FALSE → manual entry required
+#
+# Returns: list(LOD_Hi = list(<tgt> = <val>, …), LOD_Lo = list(…))
+.collect_lod_for_plate <- function(fi, cls, target_lod, std_force_lod, n_expected,
+                                   ask_hi, ask_lo, infer_hi, infer_lo) {
+
+  tgts      <- fi$targets
+  tgt_label <- paste(tgts, collapse = ", ")
+  ref_tgt   <- tgts[[1]]   # representative target for reference-value lookup
+
+  # Pull reference values from the first target (all must be equal per pipeline rules).
+  norm_hi <- tryCatch(target_lod$LOD_Hi[[ref_tgt]],    error = function(e) NULL)
+  norm_lo <- tryCatch(target_lod$LOD_Lo[[ref_tgt]],    error = function(e) NULL)
+  def_hi  <- tryCatch(std_force_lod$LOD_Hi[[ref_tgt]], error = function(e) NULL)
+  def_lo  <- tryCatch(std_force_lod$LOD_Lo[[ref_tgt]], error = function(e) NULL)
+
+  # ---- LOD Hi ----
+  if (ask_hi) {
+    norm_hi_str <- if (!is.null(norm_hi)) sprintf("%g", norm_hi) else "(not in TARGET_LOD)"
+    hi_ref_val  <- if (!is.null(norm_hi)) norm_hi else def_hi
+
+    cat(sprintf("    Targets : %s\n", tgt_label))
+
+    if (infer_hi && !is.null(hi_ref_val)) {
+      cat(sprintf(
+        "    LOD Hi  [normal = %s | Std-001 present \u2192 inferred; applies to all targets]\n",
+        norm_hi_str
+      ))
+      cat(sprintf("    \u2192 Is LOD Hi = %g correct for this plate? [Y/n]: ", hi_ref_val))
+      yn <- toupper(trimws(readline()))
+      if (yn == "" || yn == "Y") {
+        hi_val <- hi_ref_val
+        cat(sprintf("    \u2192 Accepted: %g\n", hi_val))
+      } else {
+        cat(sprintf("    Enter LOD Hi (all targets)%s: ",
+                    if (!is.null(def_hi)) sprintf(" [default: %g]", def_hi) else ""))
+        raw_in <- trimws(readline())
+        if (raw_in == "" && !is.null(def_hi)) {
+          hi_val <- def_hi
+          cat(sprintf("    \u2192 Accepted default: %g\n", hi_val))
+        } else {
+          hi_val <- suppressWarnings(as.numeric(raw_in))
+          while (is.na(hi_val) || hi_val <= 0) {
+            cat("    Please enter a positive number for LOD Hi: ")
+            hi_val <- suppressWarnings(as.numeric(trimws(readline())))
+          }
+        }
+      }
+    } else {
+      reason_str <- if (!infer_hi) "Std-001 MISSING \u2192 manual entry required"
+                    else           "no TARGET_LOD value \u2192 manual entry required"
+      cat(sprintf(
+        "    LOD Hi  [normal = %s | %s; applies to all targets]\n",
+        norm_hi_str, reason_str
+      ))
+      cat(sprintf("    Enter LOD Hi (all targets)%s: ",
+                  if (!is.null(def_hi)) sprintf(" [default: %g]", def_hi) else ""))
+      raw_in <- trimws(readline())
+      if (raw_in == "" && !is.null(def_hi)) {
+        hi_val <- def_hi
+        cat(sprintf("    \u2192 Accepted default: %g\n", hi_val))
+      } else {
+        hi_val <- suppressWarnings(as.numeric(raw_in))
+        while (is.na(hi_val) || hi_val <= 0) {
+          cat("    Please enter a positive number for LOD Hi: ")
+          hi_val <- suppressWarnings(as.numeric(trimws(readline())))
+        }
+      }
+    }
+    cat("\n")
+
+  } else {
+    # LOD Hi unaffected — use TARGET_LOD reference value (same for all targets)
+    hi_val <- if (!is.null(norm_hi)) norm_hi else def_hi
+  }
+
+  # ---- LOD Lo ----
+  if (ask_lo) {
+    norm_lo_str <- if (!is.null(norm_lo)) sprintf("%g", norm_lo) else "(not in TARGET_LOD)"
+    lo_ref_val  <- if (!is.null(norm_lo)) norm_lo else def_lo
+
+    if (!ask_hi) cat(sprintf("    Targets : %s\n", tgt_label))  # only reprint if Hi was skipped
+
+    if (infer_lo && !is.null(lo_ref_val)) {
+      cat(sprintf(
+        "    LOD Lo  [normal = %s | Std-%03d present \u2192 inferred; applies to all targets]\n",
+        norm_lo_str, n_expected
+      ))
+      cat(sprintf("    \u2192 Is LOD Lo = %g correct for this plate? [Y/n]: ", lo_ref_val))
+      yn <- toupper(trimws(readline()))
+      if (yn == "" || yn == "Y") {
+        lo_val <- lo_ref_val
+        cat(sprintf("    \u2192 Accepted: %g\n", lo_val))
+      } else {
+        cat(sprintf("    Enter LOD Lo (all targets)%s: ",
+                    if (!is.null(def_lo)) sprintf(" [default: %g]", def_lo) else ""))
+        raw_in <- trimws(readline())
+        if (raw_in == "" && !is.null(def_lo)) {
+          lo_val <- def_lo
+          cat(sprintf("    \u2192 Accepted default: %g\n", lo_val))
+        } else {
+          lo_val <- suppressWarnings(as.numeric(raw_in))
+          while (is.na(lo_val) || lo_val <= 0) {
+            cat("    Please enter a positive number for LOD Lo: ")
+            lo_val <- suppressWarnings(as.numeric(trimws(readline())))
+          }
+        }
+      }
+    } else {
+      reason_str <- if (!infer_lo) sprintf("Std-%03d MISSING \u2192 manual entry required", n_expected)
+                    else           "no TARGET_LOD value \u2192 manual entry required"
+      cat(sprintf(
+        "    LOD Lo  [normal = %s | %s; applies to all targets]\n",
+        norm_lo_str, reason_str
+      ))
+      cat(sprintf("    Enter LOD Lo (all targets)%s: ",
+                  if (!is.null(def_lo)) sprintf(" [default: %g]", def_lo) else ""))
+      raw_in <- trimws(readline())
+      if (raw_in == "" && !is.null(def_lo)) {
+        lo_val <- def_lo
+        cat(sprintf("    \u2192 Accepted default: %g\n", lo_val))
+      } else {
+        lo_val <- suppressWarnings(as.numeric(raw_in))
+        while (is.na(lo_val) || lo_val <= 0) {
+          cat("    Please enter a positive number for LOD Lo: ")
+          lo_val <- suppressWarnings(as.numeric(trimws(readline())))
+        }
+      }
+    }
+    cat("\n")
+
+  } else {
+    # LOD Lo unaffected — use TARGET_LOD reference value (same for all targets)
+    lo_val <- if (!is.null(norm_lo)) norm_lo else def_lo
+  }
+
+  # Broadcast the single hi_val / lo_val to every target so the returned list
+  # is fully keyed and compatible with process_plate()'s LOD resolution logic.
+  lod_hi_out <- setNames(lapply(tgts, function(.) hi_val), tgts)
+  lod_lo_out <- setNames(lapply(tgts, function(.) lo_val), tgts)
+
+  list(LOD_Hi = lod_hi_out, LOD_Lo = lod_lo_out)
+}
+
+
+# -------------------------------------------------------
+# .force_all_plates()
+# -------------------------------------------------------
+# Internal helper called by ask_standards_action() for option F.
+# Collects LOD overrides for every failing plate. Inference (Y/N)
+# is applied where the corresponding endpoint standard is present;
+# manual entry is required where it is missing.
+#
+# Returns: list(skip_files = character(0), force_lods = named list)
+.force_all_plates <- function(failing_info, classifications, n_expected,
+                              target_lod, std_force_lod) {
+
+  cat(sprintf(
+    "\n  You will now enter LOD overrides for each plate.\n"
+  ))
+  cat(sprintf(
+    "  (STD_FORCE_LOD %s  |  TARGET_LOD values shown as 'normal' for reference)\n\n",
+    if (is.null(std_force_lod)) "is NOT defined" else "is defined"
+  ))
+
+  force_lods <- list()
+
+  for (i in seq_along(failing_info)) {
+    fi  <- failing_info[[i]]
+    cls <- classifications[[i]]
+
+    stem_label <- file_stem(fi$file)
+    cat(sprintf("  --- %s ---\n", stem_label))
+    cat(sprintf("      Found   : %s\n", paste(fi$found,   collapse = ", ")))
+    cat(sprintf("      Missing : %s\n\n", paste(fi$missing, collapse = ", ")))
+
+    if (!is.null(fi$error) || identical(cls$type, "error")) {
+      if (is.null(std_force_lod))
+        stop("Cannot force '", stem_label, "': file read error and STD_FORCE_LOD is NULL.",
+             call. = FALSE)
+      cat("  File read error — using STD_FORCE_LOD directly.\n\n")
+      force_lods[[fi$file]] <- std_force_lod
+      next
+    }
+
+    if (length(fi$targets) == 0) {
+      cat("  Warning: no targets found in this plate.\n")
+      if (is.null(std_force_lod))
+        stop("Cannot force '", stem_label, "': no targets found and STD_FORCE_LOD is NULL.",
+             call. = FALSE)
+      cat("  Using STD_FORCE_LOD directly.\n\n")
+      force_lods[[fi$file]] <- std_force_lod
+      next
+    }
+
+    plate_lod <- .collect_lod_for_plate(
+      fi            = fi,
+      cls           = cls,
+      target_lod    = target_lod,
+      std_force_lod = std_force_lod,
+      n_expected    = n_expected,
+      ask_hi        = TRUE,
+      ask_lo        = TRUE,
+      infer_hi      = !cls$hi_endpoint_missing,
+      infer_lo      = !cls$lo_endpoint_missing
+    )
+    force_lods[[fi$file]] <- plate_lod
+    cat(sprintf("  LOD override recorded for %s.\n\n", stem_label))
+  }
+
+  force_type <- setNames(
+    rep(list("force_override"), length(force_lods)),
+    names(force_lods)
+  )
+  list(skip_files = character(0), force_lods = force_lods, force_type = force_type)
+}
+
+
 # Shows a combined console summary of all plates that failed the standards check,
-# then prompts the user to either skip them all or force them through.
+# classifies each by missing-standard pattern, then offers up to three actions:
 #
-# Interactive — force path: collects per-target LOD_Hi and LOD_Lo for each plate.
-#   STD_FORCE_LOD values are offered as defaults (press Enter to accept).
+#   S — Skip all failing plates (excluded from this run).
 #
-# Non-interactive — always forces through using STD_FORCE_LOD.
-#   Errors if STD_FORCE_LOD is NULL, since no values can be entered.
+#   M — Allow middle-only missing plates through; collect LOD overrides only for
+#       endpoint-missing plates.  Only shown when middle-only plates exist.
+#       • Plates missing 1–2 middle standards: Y/N LOD confirmation (both endpoints
+#         are present so TARGET_LOD values are inferred; manual entry only if N).
+#       • Plates missing >2 middle standards: per-plate Y/N include/exclude prompt.
+#         If included they are treated as endpoint-missing (LOD entry required).
+#         If excluded they are NOT processed this run.
+#
+#   F — Force all failing plates through; collect LOD overrides for every plate.
+#       Inference (Y/N) is applied where the corresponding endpoint standard is
+#       present.  Manual entry is required where an endpoint standard is missing.
+#
+# The "normal" TARGET_LOD values are shown alongside every prompt so the user
+# can make an informed decision without consulting the script.
+#
+# Non-interactive: auto-forces all plates through using STD_FORCE_LOD (errors if NULL).
 #
 # Args:
 #   failing_info  : list of named lists, one per failing plate:
 #                   $file, $found, $missing, $targets, $error
 #   n_expected    : N_STANDARDS
-#   std_force_lod : STD_FORCE_LOD from Section 1
+#   std_force_lod : STD_FORCE_LOD from Section 1 (may be NULL)
+#   target_lod    : TARGET_LOD from Section 2
 #
 # Returns a named list:
 #   $skip_files : character vector of file paths to remove from processing
 #   $force_lods : named list of per-file LOD overrides (keyed by file path)
-ask_standards_action <- function(failing_info, n_expected, std_force_lod) {
+ask_standards_action <- function(failing_info, n_expected, std_force_lod, target_lod) {
 
-  n_fail <- length(failing_info)
+  n_fail  <- length(failing_info)
 
-  # ---- Print combined failure summary ----
+  # ---- Classify each failing plate ----
+  classifications <- lapply(failing_info, function(fi) {
+    if (!is.null(fi$error)) {
+      list(type = "error", hi_endpoint_missing = NA, lo_endpoint_missing = NA,
+           n_missing_middle = NA_integer_, missing_middle_stds = character(),
+           missing_hi_half = NA, missing_lo_half = NA,
+           needs_both_lods = NA, needs_hi_only = NA, needs_lo_only = NA,
+           hi_nums = integer(0), lo_nums = integer(0))
+    } else {
+      classify_missing_standards(fi$missing, n_expected)
+    }
+  })
+
+  type_vec          <- vapply(classifications, function(c) c$type, character(1))
+  is_middle_1_2     <- type_vec == "middle_1_2"
+  is_middle_3p      <- type_vec == "middle_3plus"
+  is_end_missing    <- type_vec == "end_missing"
+  has_middle_plates <- any(is_middle_1_2 | is_middle_3p)
+
+  # Derive the Hi/Lo split boundaries from the first non-error classification,
+  # rather than recomputing them here (single authoritative source: classify_missing_standards).
+  first_valid <- Find(function(c) c$type != "error", classifications)
+  if (is.null(first_valid)) {
+    # All plates had file-read errors; fall back to computing directly
+    hi_nums <- seq_len(floor(n_expected / 2L))
+    lo_nums <- seq.int(floor(n_expected / 2L) + 1L, n_expected)
+  } else {
+    hi_nums <- first_valid$hi_nums
+    lo_nums <- first_valid$lo_nums
+  }
+
+  # ---- Print failure summary ----
   cat(sprintf("\n%s\n", strrep("-", .pg_width)))
   cat(sprintf(
-    " Standards check: %d plate(s) failed (expected %d standards: %s)\n",
-    n_fail, n_expected,
-    paste(sprintf("Std-%03d", seq_len(n_expected)), collapse = ", ")
+    " Standards check: %d plate(s) failed (expected Std-001 \u2013 Std-%03d)\n",
+    n_fail, n_expected
+  ))
+  cat(sprintf(
+    " Hi half : Std-%03d \u2013 Std-%03d  (Std-001 = LOD Hi endpoint)\n",
+    min(hi_nums), max(hi_nums)
+  ))
+  cat(sprintf(
+    " Lo half : Std-%03d \u2013 Std-%03d  (Std-%03d = LOD Lo endpoint)\n",
+    min(lo_nums), max(lo_nums), n_expected
   ))
   cat(strrep("-", .pg_width), "\n")
 
-  for (fi in failing_info) {
+  for (i in seq_along(failing_info)) {
+    fi  <- failing_info[[i]]
+    cls <- classifications[[i]]
+
     if (!is.null(fi$error)) {
       cat(sprintf("  [ERROR] %s\n    Could not read file: %s\n\n",
                   file_stem(fi$file), fi$error))
-    } else {
-      cat(sprintf(
-        "  %s\n    Found   : %s\n    Missing : %s\n\n",
-        file_stem(fi$file),
-        if (length(fi$found)   == 0) "(none)" else paste(fi$found,   collapse = ", "),
-        if (length(fi$missing) == 0) "(none)" else paste(fi$missing, collapse = ", ")
-      ))
+      next
     }
+
+    # Classification tag shown next to plate name
+    cls_tag <- switch(cls$type,
+      "middle_1_2"   = sprintf("[MIDDLE ONLY \u2014 %d interior standard(s) missing, both endpoints present]",
+                               cls$n_missing_middle),
+      "middle_3plus" = sprintf("[MIDDLE ONLY \u2014 %d interior standards missing (>2), both endpoints present]",
+                               cls$n_missing_middle),
+      "end_missing"  = "[ENDPOINT MISSING]",
+      "[UNKNOWN]"
+    )
+
+    # Which LODs are affected
+    lod_note <- if (isTRUE(cls$needs_both_lods)) {
+      "LOD Hi AND LOD Lo both affected"
+    } else if (isTRUE(cls$needs_hi_only)) {
+      sprintf("LOD Hi affected (missing from Hi half: Std-%03d\u2013Std-%03d)",
+              min(hi_nums), max(hi_nums))
+    } else if (isTRUE(cls$needs_lo_only)) {
+      sprintf("LOD Lo affected (missing from Lo half: Std-%03d\u2013Std-%03d)",
+              min(lo_nums), max(lo_nums))
+    } else {
+      "LOD impact undetermined"
+    }
+
+    # Normal LOD reference from TARGET_LOD (first target shown as representative)
+    lod_ref_line <- if (length(fi$targets) > 0) {
+      ref_tgt    <- fi$targets[[1]]
+      ref_hi     <- tryCatch(target_lod$LOD_Hi[[ref_tgt]], error = function(e) NULL)
+      ref_lo     <- tryCatch(target_lod$LOD_Lo[[ref_tgt]], error = function(e) NULL)
+      sprintf("    Normal LOD : Hi = %s, Lo = %s  (for '%s'; from TARGET_LOD)\n",
+              if (!is.null(ref_hi)) sprintf("%g", ref_hi) else "n/a",
+              if (!is.null(ref_lo)) sprintf("%g", ref_lo) else "n/a",
+              ref_tgt)
+    } else {
+      "    Normal LOD : (no targets found in this plate)\n"
+    }
+
+    cat(sprintf(
+      "  %s  %s\n    Found   : %s\n    Missing : %s\n%s    LOD     : %s\n\n",
+      file_stem(fi$file), cls_tag,
+      if (length(fi$found)   == 0) "(none)" else paste(fi$found,   collapse = ", "),
+      if (length(fi$missing) == 0) "(none)" else paste(fi$missing, collapse = ", "),
+      lod_ref_line,
+      lod_note
+    ))
   }
   cat(strrep("-", .pg_width), "\n")
 
@@ -605,97 +1127,335 @@ ask_standards_action <- function(failing_info, n_expected, std_force_lod) {
       lapply(failing_info, function(fi) std_force_lod),
       vapply(failing_info, function(fi) fi$file, character(1))
     )
-    return(list(skip_files = character(0), force_lods = force_lods))
+    force_type <- setNames(
+      rep(list("force_override"), length(force_lods)),
+      names(force_lods)
+    )
+    return(list(skip_files = character(0), force_lods = force_lods,
+                force_type = force_type))
+  }
+
+  # ---- Interactive: show options ----
+  cat("\n Options:\n")
+  cat("   S = Skip all failing plates (excluded from this run)\n")
+  if (has_middle_plates) {
+    cat("   M = Allow middle-only plates through with Y/N LOD confirmation;\n")
+    cat("       enter LOD overrides only for endpoint-missing plates\n")
+    cat("       (plates missing >2 middle standards will be asked individually)\n")
+  }
+  cat("   F = Force all failing plates through (enter LOD overrides for every plate)\n")
+
+  valid_opts <- if (has_middle_plates) c("S", "M", "F") else c("S", "F")
+  cat(sprintf(" Enter %s: ", paste(valid_opts, collapse = " or ")))
+
+  response <- toupper(trimws(readline()))
+  while (!response %in% valid_opts) {
+    cat(sprintf("  Please enter %s: ", paste(valid_opts, collapse = " or ")))
+    response <- toupper(trimws(readline()))
+  }
+
+  # ---- S: Skip all ----
+  if (response == "S") {
+    skip_files <- vapply(failing_info, function(fi) fi$file, character(1))
+    cat(sprintf("  Skipping %d plate(s).\n\n", length(skip_files)))
+    return(list(skip_files = skip_files, force_lods = list(),
+                force_type = list()))
+  }
+
+  # ---- F: Force all ----
+  if (response == "F") {
+    result <- .force_all_plates(failing_info, classifications, n_expected,
+                                target_lod, std_force_lod)
+    result$force_type <- setNames(
+      rep(list("force_override"), length(result$force_lods)),
+      names(result$force_lods)
+    )
+    return(result)
+  }
+
+  # ---- M: Middle-only plates pass; endpoint-missing plates get LOD entry ----
+  skip_files <- character(0)
+  force_lods <- list()
+
+  cat(sprintf(
+    "\n  Option M selected \u2014 processing %d failing plate(s).\n\n", n_fail
+  ))
+
+  # Sub-step 1: Plates missing >2 middle standards — individual include/exclude prompt
+  if (any(is_middle_3p)) {
+    cat(sprintf("%s\n", strrep("-", .pg_width)))
+    cat(sprintf(
+      " %d plate(s) are missing MORE THAN 2 interior standards.\n", sum(is_middle_3p)
+    ))
+    cat(" Each requires an individual decision:\n")
+    cat("   Y = Include (treated as endpoint-missing; LOD entry required)\n")
+    cat("   N = Exclude (will NOT be processed this run)\n")
+    cat(strrep("-", .pg_width), "\n")
+
+    for (i in which(is_middle_3p)) {
+      fi  <- failing_info[[i]]
+      cls <- classifications[[i]]
+      cat(sprintf(
+        "  %s\n    Missing : %s  (%d interior standards missing)\n",
+        file_stem(fi$file),
+        paste(fi$missing, collapse = ", "),
+        cls$n_missing_middle
+      ))
+      cat("  Include this plate? [Y/N]: ")
+      yn <- toupper(trimws(readline()))
+      while (!yn %in% c("Y", "N")) {
+        cat("  Please enter Y or N: ")
+        yn <- toupper(trimws(readline()))
+      }
+      if (yn == "Y") {
+        is_end_missing[[i]] <- TRUE   # promote to endpoint-missing treatment
+        cat(sprintf("  \u2192 '%s' included \u2014 will require LOD entry.\n\n",
+                    file_stem(fi$file)))
+      } else {
+        skip_files <- c(skip_files, fi$file)
+        cat(sprintf("  \u2192 '%s' excluded \u2014 will NOT be processed.\n\n",
+                    file_stem(fi$file)))
+      }
+    }
+  }
+
+  # Sub-step 2: Middle-only 1–2 missing plates — Y/N LOD confirmation
+  n_m12 <- sum(is_middle_1_2)
+  if (n_m12 > 0) {
+    cat(sprintf("%s\n", strrep("-", .pg_width)))
+    cat(sprintf(
+      " Confirming LODs for %d middle-only plate(s) (1\u20132 interior standards missing, endpoints intact):\n",
+      n_m12
+    ))
+    cat(strrep("-", .pg_width), "\n")
+
+    for (i in which(is_middle_1_2)) {
+      fi  <- failing_info[[i]]
+      cls <- classifications[[i]]
+      cat(sprintf("  --- %s ---\n", file_stem(fi$file)))
+      cat(sprintf("      Found   : %s\n",   paste(fi$found,   collapse = ", ")))
+      cat(sprintf("      Missing : %s\n\n", paste(fi$missing, collapse = ", ")))
+
+      if (length(fi$targets) == 0) {
+        cat("  Warning: no targets found \u2014 using TARGET_LOD / STD_FORCE_LOD directly.\n\n")
+        force_lods[[fi$file]] <- if (!is.null(std_force_lod)) std_force_lod else
+          list(LOD_Hi = target_lod$LOD_Hi, LOD_Lo = target_lod$LOD_Lo)
+        next
+      }
+
+      # Both endpoints present → infer both LODs with Y/N
+      plate_lod <- .collect_lod_for_plate(
+        fi = fi, cls = cls, target_lod = target_lod, std_force_lod = std_force_lod,
+        n_expected = n_expected,
+        ask_hi = TRUE, ask_lo = TRUE,
+        infer_hi = TRUE,   # Std-001 present by definition for middle-only
+        infer_lo = TRUE    # Std-NNN present by definition for middle-only
+      )
+      force_lods[[fi$file]] <- plate_lod
+      cat(sprintf("  LOD override recorded for %s.\n\n", file_stem(fi$file)))
+    }
+  }
+
+  # Sub-step 3: Endpoint-missing plates (including any promoted from >2 middle)
+  n_end <- sum(is_end_missing)
+  if (n_end > 0) {
+    cat(sprintf("%s\n", strrep("-", .pg_width)))
+    cat(sprintf(
+      " Entering LOD overrides for %d endpoint-missing plate(s):\n", n_end
+    ))
+    cat(strrep("-", .pg_width), "\n")
+
+    for (i in which(is_end_missing)) {
+      fi  <- failing_info[[i]]
+      cls <- classifications[[i]]
+
+      cat(sprintf("  --- %s ---\n", file_stem(fi$file)))
+      cat(sprintf("      Found   : %s\n",   paste(fi$found,   collapse = ", ")))
+      cat(sprintf("      Missing : %s\n\n", paste(fi$missing, collapse = ", ")))
+
+      if (length(fi$targets) == 0) {
+        cat("  Warning: no targets found \u2014 using TARGET_LOD / STD_FORCE_LOD directly.\n\n")
+        force_lods[[fi$file]] <- if (!is.null(std_force_lod)) std_force_lod else
+          list(LOD_Hi = target_lod$LOD_Hi, LOD_Lo = target_lod$LOD_Lo)
+        next
+      }
+
+      # Ask only for the LOD(s) where standards are missing on that half.
+      # Inference (Y/N) applies where the corresponding endpoint IS still present.
+      ask_hi <- cls$missing_hi_half
+      ask_lo <- cls$missing_lo_half
+      if (!ask_hi && !ask_lo) { ask_hi <- TRUE; ask_lo <- TRUE }  # guard / fallback
+
+      plate_lod <- .collect_lod_for_plate(
+        fi = fi, cls = cls, target_lod = target_lod, std_force_lod = std_force_lod,
+        n_expected = n_expected,
+        ask_hi   = ask_hi,
+        ask_lo   = ask_lo,
+        infer_hi = !cls$hi_endpoint_missing,
+        infer_lo = !cls$lo_endpoint_missing
+      )
+      force_lods[[fi$file]] <- plate_lod
+      cat(sprintf("  LOD override recorded for %s.\n\n", file_stem(fi$file)))
+    }
+  }
+
+  # Tag each forced plate so Section 8 can write the correct audit note.
+  # middle_confirmed = Y/N LOD confirmation (both endpoints intact)
+  # force_override   = manual LOD entry (endpoint missing or >2 middle promoted)
+  force_type <- lapply(names(force_lods), function(fp) {
+    cls_i <- classifications[[which(vapply(failing_info,
+                                           function(fi) fi$file == fp, logical(1)))]]
+    if (isTRUE(cls_i$type == "middle_1_2")) "middle_confirmed" else "force_override"
+  })
+  force_type <- setNames(force_type, names(force_lods))
+
+  list(skip_files = skip_files, force_lods = force_lods, force_type = force_type)
+}
+
+
+# -------------------------------------------------------
+# Sample-names check helpers
+# -------------------------------------------------------
+
+# Reads a plate file and checks whether every row in the Sample
+# column is blank (NA or empty string).  Uses the same dynamic
+# header detection as process_plate() for consistency.
+#
+# Args:
+#   file : path to the plate CSV
+#
+# Returns a named list:
+#   $all_blank    : TRUE if every sample value is NA / empty
+#   $n_rows       : total data rows found
+#   $n_blank      : count of blank sample rows
+#   $content_vals : up to 6 unique Content values (for display)
+#   $error        : NULL on success; error message string otherwise
+check_plate_sample_names <- function(file) {
+  tryCatch({
+    raw_full <- read_csv(file, show_col_types = FALSE, col_names = FALSE,
+                         col_types = cols(.default = col_character()),
+                         progress = FALSE)
+    well_row <- which(raw_full[[1]] == "Well")
+
+    if (length(well_row) == 0)
+      return(list(all_blank = FALSE, n_rows = 0L, n_blank = 0L,
+                  content_vals = character(),
+                  error = "Could not find 'Well' header row"))
+
+    well_row      <- well_row[1]
+    col_headers   <- as.character(raw_full[well_row, ])
+    raw           <- raw_full[(well_row + 1):nrow(raw_full), ]
+    colnames(raw) <- col_headers
+    raw           <- clean_col_names(raw)
+
+    if (!"sample" %in% names(raw))
+      return(list(all_blank = FALSE, n_rows = nrow(raw), n_blank = 0L,
+                  content_vals = character(),
+                  error = "No 'sample' column found after header detection"))
+
+    sample_vals <- as.character(raw$sample)
+    is_blank    <- is.na(sample_vals) | !nzchar(trimws(sample_vals))
+    n_blank     <- sum(is_blank)
+    n_rows      <- nrow(raw)
+
+    content_vals <- character(0)
+    if ("content" %in% names(raw)) {
+      content_vals <- sort(unique(as.character(
+        raw$content[!is.na(raw$content) & nzchar(trimws(raw$content))]
+      )))
+      content_vals <- head(content_vals, 6)
+    }
+
+    list(all_blank    = (n_blank == n_rows),
+         n_rows       = n_rows,
+         n_blank      = n_blank,
+         content_vals = content_vals,
+         error        = NULL)
+
+  }, error = function(e) {
+    list(all_blank = FALSE, n_rows = 0L, n_blank = 0L,
+         content_vals = character(),
+         error = conditionMessage(e))
+  })
+}
+
+
+# Shows a combined console summary of all plates where every sample
+# name is blank, then prompts the user to either skip them or assign
+# the Content column as the Sample column.
+#
+# Non-interactive — always skips (default), since no user input is
+# available to confirm the content-as-sample substitution.
+#
+# Args:
+#   blank_info : list of named lists, one per affected plate:
+#                $file, $n_rows, $content_vals, $error
+#
+# Returns a named list:
+#   $skip_files             : character vector of file paths to skip
+#   $content_as_sample_files: character vector of file paths where
+#                             Content should be used as Sample
+ask_sample_names_action <- function(blank_info) {
+
+  n_blank <- length(blank_info)
+
+  cat(sprintf("\n%s\n", strrep("-", .pg_width)))
+  cat(sprintf(
+    " Sample names check: %d plate(s) have NO sample names\n", n_blank
+  ))
+  cat(strrep("-", .pg_width), "\n")
+
+  for (bi in blank_info) {
+    if (!is.null(bi$error)) {
+      cat(sprintf("  [ERROR] %s\n    Could not read file: %s\n\n",
+                  file_stem(bi$file), bi$error))
+    } else {
+      cat(sprintf(
+        "  %s\n    Rows       : %d\n    Content    : %s\n\n",
+        file_stem(bi$file),
+        bi$n_rows,
+        if (length(bi$content_vals) == 0) "(none found)"
+        else paste(bi$content_vals, collapse = ", ")
+      ))
+    }
+  }
+  cat(strrep("-", .pg_width), "\n")
+
+  # ---- Non-interactive path ----
+  if (!interactive()) {
+    cat(sprintf(
+      "\n  [non-interactive] Defaulting to S — skipping %d plate(s) with blank sample names.\n\n",
+      n_blank
+    ))
+    skip_files <- vapply(blank_info, function(bi) bi$file, character(1))
+    return(list(skip_files = skip_files, content_as_sample_files = character(0)))
   }
 
   # ---- Interactive path ----
   cat(" Options:\n")
-  cat("   S = Skip all failing plates (excluded from this run)\n")
-  cat("   F = Force all failing plates through (you will supply LOD overrides)\n")
-  cat(" Enter S or F: ")
+  cat("   S = Skip all   — exclude these plates from this run\n")
+  cat("   C = Use Content column as Sample name for all these plates\n")
+  cat(" Enter S or C: ")
 
   response <- toupper(trimws(readline()))
-  while (!response %in% c("S", "F")) {
-    cat("  Please enter S or F: ")
+  while (!response %in% c("S", "C")) {
+    cat("  Please enter S or C: ")
     response <- toupper(trimws(readline()))
   }
 
   if (response == "S") {
-    skip_files <- vapply(failing_info, function(fi) fi$file, character(1))
+    skip_files <- vapply(blank_info, function(bi) bi$file, character(1))
     cat(sprintf("  Skipping %d plate(s).\n\n", length(skip_files)))
-    return(list(skip_files = skip_files, force_lods = list()))
+    return(list(skip_files = skip_files, content_as_sample_files = character(0)))
   }
 
-  # ---- Force: collect per-target LOD for each plate ----
+  # ---- Content-as-sample path ----
+  content_files <- vapply(blank_info, function(bi) bi$file, character(1))
   cat(sprintf(
-    "\n  You will now enter LOD overrides for each plate.\n  (STD_FORCE_LOD %s — shown as [default] where applicable)\n\n",
-    if (is.null(std_force_lod)) "is NOT defined" else "is defined"
+    "\n  Content column will be used as Sample name for %d plate(s).\n\n",
+    length(content_files)
   ))
-
-  force_lods <- list()
-
-  for (fi in failing_info) {
-    stem_label <- file_stem(fi$file)
-    cat(sprintf("  --- %s ---\n", stem_label))
-    cat(sprintf("      Found   : %s\n", paste(fi$found,   collapse = ", ")))
-    cat(sprintf("      Missing : %s\n\n", paste(fi$missing,   collapse = ", ")))
-
-    if (length(fi$targets) == 0) {
-      cat("  Warning: no targets found in this plate.\n")
-      if (is.null(std_force_lod))
-        stop("Cannot force '", stem_label, "': no targets found and STD_FORCE_LOD is NULL.",
-             call. = FALSE)
-      cat("  Using STD_FORCE_LOD directly.\n\n")
-      force_lods[[fi$file]] <- std_force_lod
-      next
-    }
-
-    lod_hi_out <- list()
-    lod_lo_out <- list()
-
-    for (tgt in fi$targets) {
-      def_hi <- tryCatch(std_force_lod$LOD_Hi[[tgt]], error = function(e) NULL)
-      def_lo <- tryCatch(std_force_lod$LOD_Lo[[tgt]], error = function(e) NULL)
-
-      # LOD_Hi
-      cat(sprintf("    Target '%s'  LOD_Hi%s: ", tgt,
-                  if (!is.null(def_hi)) sprintf(" [default: %g]", def_hi) else ""))
-      raw_in <- trimws(readline())
-      if (raw_in == "" && !is.null(def_hi)) {
-        hi_val <- def_hi
-        cat(sprintf("    → Accepted default: %g\n", hi_val))
-      } else {
-        hi_val <- suppressWarnings(as.numeric(raw_in))
-        while (is.na(hi_val) || hi_val <= 0) {
-          cat(sprintf("    Please enter a positive number for LOD_Hi ('%s'): ", tgt))
-          hi_val <- suppressWarnings(as.numeric(trimws(readline())))
-        }
-      }
-
-      # LOD_Lo
-      cat(sprintf("    Target '%s'  LOD_Lo%s: ", tgt,
-                  if (!is.null(def_lo)) sprintf(" [default: %g]", def_lo) else ""))
-      raw_in <- trimws(readline())
-      if (raw_in == "" && !is.null(def_lo)) {
-        lo_val <- def_lo
-        cat(sprintf("    → Accepted default: %g\n", lo_val))
-      } else {
-        lo_val <- suppressWarnings(as.numeric(raw_in))
-        while (is.na(lo_val) || lo_val <= 0) {
-          cat(sprintf("    Please enter a positive number for LOD_Lo ('%s'): ", tgt))
-          lo_val <- suppressWarnings(as.numeric(trimws(readline())))
-        }
-      }
-
-      lod_hi_out[[tgt]] <- hi_val
-      lod_lo_out[[tgt]] <- lo_val
-    }
-
-    force_lods[[fi$file]] <- list(LOD_Hi = lod_hi_out, LOD_Lo = lod_lo_out)
-    cat(sprintf("  LOD override recorded for %s.\n\n", stem_label))
-  }
-
-  list(skip_files = character(0), force_lods = force_lods)
+  list(skip_files = character(0), content_as_sample_files = content_files)
 }
 
 
@@ -833,11 +1593,11 @@ pg_summary <- function(n_out, n_review, elapsed_secs) {
 # to on subsequent runs, giving a full cross-session history.
 
 # --- Internal: resolve the current input file name ---
-# process_plate() sets .current_input_file in the global env so that
-# all logging calls within a plate run record the correct source file.
-.resolve_input_file <- function(default_file) {
-  val <- get0(".current_input_file", envir = .GlobalEnv, inherits = FALSE)
-  if (is.null(val)) basename(default_file) else basename(val)
+# Accepts the file path passed directly by the caller; no global-env side-channel.
+# Both log_decision() and log_variables() require the caller to supply
+# current_file explicitly, eliminating the need for assign() calls in Section 8.
+.resolve_input_file <- function(current_file) {
+  basename(current_file)
 }
 
 # --- Decision log ---
@@ -876,28 +1636,59 @@ ensure_dec_log <- function(path) {
 #   evidence     : human-readable string explaining why the rule fired
 #   run_id       : unique ID for this plate run
 #   dec_log_path : path to the decision log CSV
-#   default_file : fallback file name if .current_input_file is not set
+#   current_file : path of the plate file being processed (used as input_file)
 log_decision <- function(sample_id, target, rule_id, outcome, evidence,
-                         run_id, dec_log_path, default_file) {
+                         run_id, dec_log_path, current_file) {
   ensure_dec_log(dec_log_path)
   entry <- tibble(
     timestamp  = now(tzone = "UTC"),
     user       = Sys.info()[["user"]],
     run_id     = run_id,
-    input_file = .resolve_input_file(default_file),
+    input_file = .resolve_input_file(current_file),
     sample_id  = as.character(sample_id %||% NA_character_),
     target     = as.character(target     %||% NA_character_),
     rule_id    = rule_id,
     outcome    = outcome,
     evidence   = evidence,
     source     = "R_script",
-    version    = "0.1.10"
+    version    = SCRIPT_VERSION
   )
   write_csv_retry(entry, dec_log_path, append = TRUE)
   invisible(entry)
 }
 
-# --- Variable log ---
+
+# Appends multiple decision rows to the log in a SINGLE write call.
+#
+# This replaces the old rowwise()|>do() pattern with a vectorised approach
+# that is both faster (one file open/write/close per step instead of one per
+# row) and compatible with future dplyr releases (do() is deprecated).
+#
+# Args:
+#   df           : data frame with columns: sample_id, target, rule_id,
+#                  outcome, evidence  (all character; NA where not applicable)
+#   run_id       : unique ID for this plate run
+#   dec_log_path : path to the decision log CSV
+#   current_file : path of the plate file being processed
+log_decisions_batch <- function(df, run_id, dec_log_path, current_file) {
+  if (is.null(df) || nrow(df) == 0L) return(invisible(NULL))
+  ensure_dec_log(dec_log_path)
+  entries <- tibble(
+    timestamp  = now(tzone = "UTC"),
+    user       = Sys.info()[["user"]],
+    run_id     = run_id,
+    input_file = .resolve_input_file(current_file),
+    sample_id  = as.character(df$sample_id),
+    target     = as.character(df$target),
+    rule_id    = as.character(df$rule_id),
+    outcome    = as.character(df$outcome),
+    evidence   = as.character(df$evidence),
+    source     = "R_script",
+    version    = SCRIPT_VERSION
+  )
+  write_csv_retry(entries, dec_log_path, append = TRUE)
+  invisible(entries)
+}
 
 # Creates the variable log CSV with typed headers if it does not exist.
 ensure_var_log <- function(path) {
@@ -968,10 +1759,10 @@ ensure_var_log <- function(path) {
 #   vars         : named list, e.g. list(threshold = 1.0, targets = c("fucp"))
 #   run_id       : unique ID for this plate run
 #   var_log_path : path to the variable log CSV
-#   default_file : fallback file name if .current_input_file is not set
+#   current_file : path of the plate file being processed (used as input_file)
 #   sample_id    : optional — links the entry to a specific sample
 #   target       : optional — links the entry to a specific target
-log_variables <- function(vars, run_id, var_log_path, default_file,
+log_variables <- function(vars, run_id, var_log_path, current_file,
                           sample_id = NULL, target = NULL) {
   if (is.null(vars) || length(vars) == 0) return(invisible(tibble()))
   if (is.null(names(vars)) || any(is.na(names(vars)) | names(vars) == "")) {
@@ -988,14 +1779,14 @@ log_variables <- function(vars, run_id, var_log_path, default_file,
     timestamp  = now(tzone = "UTC"),
     user       = Sys.info()[["user"]],
     run_id     = run_id,
-    input_file = .resolve_input_file(default_file),
+    input_file = .resolve_input_file(current_file),
     sample_id  = as.character(sample_id %||% NA_character_),
     target     = as.character(target     %||% NA_character_),
     var_name   = names(vars),
     var_value  = var_values,
     var_class  = var_class,
     source     = "R_script",
-    version    = "0.1.10"
+    version    = SCRIPT_VERSION
   )
 
   write_csv_retry(entry, var_log_path, append = TRUE)
@@ -1005,7 +1796,7 @@ log_variables <- function(vars, run_id, var_log_path, default_file,
 # [UTILITY — not called in main pipeline, available for future use]
 # Convenience wrapper: logs selected columns from a single-row data frame.
 log_variables_from_df <- function(df, cols, run_id, var_log_path,
-                                  default_file, sample_id = NULL, target = NULL) {
+                                  current_file, sample_id = NULL, target = NULL) {
   stopifnot(is.data.frame(df), all(cols %in% names(df)), nrow(df) == 1)
   vars <- as.list(df[1, cols, drop = FALSE])
   names(vars) <- cols
@@ -1013,10 +1804,62 @@ log_variables_from_df <- function(df, cols, run_id, var_log_path,
     vars         = vars,
     run_id       = run_id,
     var_log_path = var_log_path,
-    default_file = default_file,
+    current_file = current_file,
     sample_id    = sample_id,
     target       = target
   )
+}
+
+
+# ============================================================
+# validate_target_lod()
+# ============================================================
+# Pre-flight structural check called once at the start of Section 8.
+#
+# Verifies that TARGET_LOD is correctly formed:
+#   - Both $LOD_Hi and $LOD_Lo sub-lists are present and non-empty.
+#   - Every value in each sub-list is a positive, finite number.
+#
+# NOTE: This function does NOT check that all targets share the same
+# LOD value — that constraint is per-plate, not global.  Different
+# target groups (e.g. "uni" at 200 vs "nuc" at 2000) are perfectly
+# valid in TARGET_LOD; process_plate() enforces equality only for
+# the specific targets that appear together on a single plate.
+#
+# Args:
+#   lod_list : TARGET_LOD (or any list with $LOD_Hi and $LOD_Lo sub-lists)
+#
+# Returns invisibly if valid; stops with an informative message if not.
+validate_target_lod <- function(lod_list) {
+  if (is.null(lod_list)) return(invisible(NULL))
+
+  check_half <- function(half_list, lod_label) {
+    if (is.null(half_list) || length(half_list) == 0L) {
+      stop("TARGET_LOD$", lod_label, " is missing or empty.\n",
+           "  Add at least one target entry in Section 2.", call. = FALSE)
+    }
+    vals <- suppressWarnings(as.numeric(unlist(half_list)))
+    bad_na  <- names(half_list)[is.na(vals)]
+    bad_neg <- names(half_list)[!is.na(vals) & vals <= 0]
+
+    if (length(bad_na) > 0)
+      stop("TARGET_LOD$", lod_label, " contains non-numeric value(s) for: ",
+           paste(bad_na, collapse = ", "),
+           "\n  All LOD values must be positive numbers. Check Section 2.",
+           call. = FALSE)
+
+    if (length(bad_neg) > 0)
+      stop("TARGET_LOD$", lod_label, " contains zero or negative value(s) for: ",
+           paste(bad_neg, collapse = ", "),
+           "\n  All LOD values must be positive numbers. Check Section 2.",
+           call. = FALSE)
+
+    invisible(NULL)
+  }
+
+  check_half(lod_list$LOD_Hi, "LOD_Hi")
+  check_half(lod_list$LOD_Lo, "LOD_Lo")
+  invisible(NULL)
 }
 
 
@@ -1054,23 +1897,20 @@ process_plate <- function(file,
                           force_lod_list = NULL,
                           dCq_thr,
                           rm_patterns, rm_cols_req,
+                          always_pos_targets = character(0),
                           plate_index, n_plates,
                           enable_preview, dry_run, debug_print,
-                          output_dir, dec_log_path, var_log_path) {
-
-  # Register the current file globally so logging helpers can pick it up
-  assign(".current_input_file", file, envir = .GlobalEnv)
+                          output_dir, dec_log_path, var_log_path,
+                          content_as_sample = FALSE) {
 
   stem   <- file_stem(file)
   run_id <- paste0(format(Sys.time(), "%Y%m%d_%H%M%S"), "_", stem)
 
   pg_plate(plate_index, n_plates, file)
   .plate_start <- Sys.time()  # wall-clock timer for per-plate elapsed time
-  # Rather than hardcoding a skip row, we read the whole file
-  # and locate the first row where column 1 contains "Well".
-  # Everything from that row onward becomes the data table.
-  # ----------------------------------------------------------
-  pg_step_start(0, "Import — locating header row")
+
+  # Import: locate the "Well" header row dynamically and read from there.
+  pg_info("Import", "locating header row ...")
 
   raw_full  <- read_csv(file, show_col_types = FALSE, col_names = FALSE,
                         col_types = cols(.default = col_character()),
@@ -1176,6 +2016,44 @@ process_plate <- function(file,
   ))
 
   # ----------------------------------------------------------
+  # Content-as-Sample substitution
+  # Only active when content_as_sample = TRUE, which is set by
+  # the sample names pre-check when the user chose option C.
+  # Overwrites the sample column with the content column value
+  # BEFORE Step 0 runs, so the blank-name removal step finds
+  # zero absent names and passes cleanly.
+  #
+  # The substitution is logged per-row with rule SAMPLE_FROM_CONTENT
+  # and a visible banner is printed so the user is aware it occurred.
+  # ----------------------------------------------------------
+  if (isTRUE(content_as_sample)) {
+    n_substituted <- sum(is.na(dat$sample) | !nzchar(trimws(as.character(dat$sample))))
+
+    cat(sprintf(
+      "  %-16s\u2502 [SAMPLE_FROM_CONTENT] Content column used as Sample name (%d row(s))\n",
+      "Override", n_substituted
+    ))
+
+    dat <- dat |> mutate(sample = content)
+
+    # Log one decision row per data row so the audit trail shows exactly
+    # which Content values became Sample names for this plate.
+    log_decisions_batch(
+      df = dat |> transmute(
+        sample_id = content,
+        target    = target,
+        rule_id   = "SAMPLE_FROM_CONTENT",
+        outcome   = "applied",
+        evidence  = paste0("Sample name blank; Content '", content,
+                           "' used as Sample name")
+      ),
+      run_id       = run_id,
+      dec_log_path = dec_log_path,
+      current_file = file
+    )
+  }
+
+  # ----------------------------------------------------------
   # Step 0: Remove rows with no sample name
   # ----------------------------------------------------------
   pg_step_start(0, "Removing unnamed samples")
@@ -1183,22 +2061,28 @@ process_plate <- function(file,
   dat <- dat |>
     mutate(
       sample_reason = case_when(
-        is.na(sample) ~ "RM_Sample_removed_due_to_absent_name",
-        TRUE          ~ NA_character_
+        is.na(sample) | !nzchar(trimws(as.character(sample))) ~
+          "RM_Sample_removed_due_to_absent_name",
+        TRUE ~ NA_character_
       )
     )
 
   n_unnamed <- sum(!is.na(dat$sample_reason))
 
-  dat |>
-    filter(!is.na(sample_reason)) |>
-    rowwise() |>
-    do({
-      log_decision(.$sample, .$target, .$sample_reason, "applied",
-                   "Removed: absent sample name", run_id, dec_log_path, file)
-      tibble(.)
-    }) |>
-    invisible()
+  log_decisions_batch(
+    df = dat |>
+      filter(!is.na(sample_reason)) |>
+      transmute(
+        sample_id = sample,
+        target    = target,
+        rule_id   = sample_reason,
+        outcome   = "applied",
+        evidence  = "Removed: absent sample name"
+      ),
+    run_id       = run_id,
+    dec_log_path = dec_log_path,
+    current_file = file
+  )
 
   dat <- dat |> filter(is.na(sample_reason))
   pg_step_done(0, sprintf("%d removed", n_unnamed))
@@ -1226,16 +2110,20 @@ process_plate <- function(file,
 
   n_adj <- sum(!is.na(dat1$sq_adj_reason))
 
-  dat1 |>
-    filter(!is.na(sq_adj_reason)) |>
-    rowwise() |>
-    do({
-      log_decision(.$sample, .$target, .$sq_adj_reason, "applied",
-                   paste0("sq_raw=", .$sq_raw, "; LOD_Lo=", LOD_Lo),
-                   run_id, dec_log_path, file)
-      tibble(.)
-    }) |>
-    invisible()
+  log_decisions_batch(
+    df = dat1 |>
+      filter(!is.na(sq_adj_reason)) |>
+      transmute(
+        sample_id = sample,
+        target    = target,
+        rule_id   = sq_adj_reason,
+        outcome   = "applied",
+        evidence  = paste0("sq_raw=", sq_raw, "; LOD_Lo=", LOD_Lo)
+      ),
+    run_id       = run_id,
+    dec_log_path = dec_log_path,
+    current_file = file
+  )
 
   pg_step_done(1, sprintf("%d values adjusted", n_adj))
   if (debug_print) { message("Table: dat1 after Step 1"); print(head(dat1)) }
@@ -1281,17 +2169,21 @@ process_plate <- function(file,
         dat1 <- dat1 |> select(-rm_hit)
         pg_step_done(2, sprintf("dry run | %d would be removed", n_hits))
       } else {
-        dat1 |>
-          filter(rm_hit) |>
-          rowwise() |>
-          do({
-            log_decision(.$sample, .$target, "RM_PATTERN", "applied",
-                         paste0("cols=", paste(rm_cols, collapse = ","),
-                                "; pattern=", combined_pat),
-                         run_id, dec_log_path, file)
-            tibble(.)
-          }) |>
-          invisible()
+        log_decisions_batch(
+          df = dat1 |>
+            filter(rm_hit) |>
+            transmute(
+              sample_id = sample,
+              target    = target,
+              rule_id   = "RM_PATTERN",
+              outcome   = "applied",
+              evidence  = paste0("cols=", paste(rm_cols, collapse = ","),
+                                 "; pattern=", combined_pat)
+            ),
+          run_id       = run_id,
+          dec_log_path = dec_log_path,
+          current_file = file
+        )
         dat1 <- dat1 |> filter(!rm_hit) |> select(-rm_hit)
         pg_step_done(2, sprintf("%d rows removed (pattern: %s)", n_hits, combined_pat))
       }
@@ -1323,16 +2215,20 @@ process_plate <- function(file,
 
   n_mismatch <- sum(name_checks$flag_name_mismatch)
 
-  name_checks |>
-    filter(flag_name_mismatch) |>
-    rowwise() |>
-    do({
-      log_decision(NA, .$target, "QC_SN_MISMATCH", "applied",
-                   paste0("content=", .$content, "; samples=", .$samples),
-                   run_id, dec_log_path, file)
-      tibble(.)
-    }) |>
-    invisible()
+  log_decisions_batch(
+    df = name_checks |>
+      filter(flag_name_mismatch) |>
+      transmute(
+        sample_id = NA_character_,
+        target    = target,
+        rule_id   = "QC_SN_MISMATCH",
+        outcome   = "applied",
+        evidence  = paste0("content=", content, "; samples=", samples)
+      ),
+    run_id       = run_id,
+    dec_log_path = dec_log_path,
+    current_file = file
+  )
 
   dat2 <- dat1 |>
     left_join(name_checks |> select(fluor, target, content, flag_name_mismatch),
@@ -1386,48 +2282,120 @@ process_plate <- function(file,
       pass_negative   = both_cq_na   # Clean negative; not a failure
     )
 
+  # ----------------------------------------------------------
+  # RV_UNEXPECTED_NEG: per-group flag for always-positive targets.
+  # A group fires this flag when the target is in always_pos_targets AND
+  # every replicate in the group was adjusted to LOD_Lo / 2.
+  # Two sub-types (joined from row-level sq_adj_reason in dat2):
+  #   "No amplification" — every Cq in the group was NA/NaN
+  #   "Below LOD_Lo"     — Cq(s) present but all SQ values fell below LOD_Lo
+  # ----------------------------------------------------------
+  if (length(always_pos_targets) > 0) {
+    # Derive a per-group indicator: were ALL rows in this group adjusted?
+    grp_adj <- dat2 |>
+      group_by(across(all_of(rep_key))) |>
+      summarise(
+        all_adjusted  = all(!is.na(sq_adj_reason)),   # every row hit Step 1 adjustment
+        all_cq_na     = all(is.na(cq_num) | is.nan(cq_num)),
+        .groups = "drop"
+      )
+
+    rep_summary <- rep_summary |>
+      left_join(grp_adj, by = rep_key) |>
+      mutate(
+        rv_unexpected_neg = !rv_excess_reps &
+                            tolower(target) %in% tolower(always_pos_targets) &
+                            coalesce(all_adjusted, FALSE),
+        rv_unexpected_neg_sub = case_when(
+          !rv_unexpected_neg   ~ NA_character_,
+          all_cq_na            ~ "No amplification",
+          TRUE                 ~ "Below LOD_Lo"
+        )
+      ) |>
+      select(-all_adjusted, -all_cq_na)
+  } else {
+    rep_summary <- rep_summary |>
+      mutate(
+        rv_unexpected_neg     = FALSE,
+        rv_unexpected_neg_sub = NA_character_
+      )
+  }
+
   n_flagged <- rep_summary |>
     summarise(n = sum(rv_excess_reps | rv_single_rep | rv_delta_cq |
-                        rv_mixed_na_num | rv_high_sq,
+                        rv_mixed_na_num | rv_high_sq | rv_unexpected_neg,
                       na.rm = TRUE)) |>
     pull(n)
 
-  # Log every flag outcome for every replicate group
-  rep_summary |>
-    rowwise() |>
-    do({
-      log_decision(.$sample, .$target, "RV_EXCESS_REPS",
-                   if (.$rv_excess_reps) "applied" else "skipped",
-                   paste0("n_rows=", .$n_rows, "; threshold=2"),
-                   run_id, dec_log_path, file)
+  # Log every flag outcome for every replicate group.
+  # All six rule columns are pivoted into long form so the entire step
+  # is written in a single append call (replaces rowwise/do pattern).
+  local({
+    rs <- rep_summary   # local alias — avoids mutating the data used downstream
 
-      log_decision(.$sample, .$target, "RV_SINGLE_REP",
-                   if (.$rv_single_rep) "applied" else "skipped",
-                   paste0("n_rows=", .$n_rows), run_id, dec_log_path, file)
+    step4_log <- bind_rows(
+      rs |> transmute(
+        sample_id = sample, target,
+        rule_id   = "RV_EXCESS_REPS",
+        outcome   = if_else(rv_excess_reps, "applied", "skipped"),
+        evidence  = paste0("n_rows=", n_rows, "; threshold=2")
+      ),
+      rs |> transmute(
+        sample_id = sample, target,
+        rule_id   = "RV_SINGLE_REP",
+        outcome   = if_else(rv_single_rep, "applied", "skipped"),
+        evidence  = paste0("n_rows=", n_rows)
+      ),
+      rs |> transmute(
+        sample_id = sample, target,
+        rule_id   = "RV_DELTA_CQ",
+        outcome   = if_else(!is.na(delta_cq) & delta_cq > dCq_thr,
+                            "applied", "skipped"),
+        evidence  = paste0("|DeltaCq|=", delta_cq, "; thr=", dCq_thr)
+      ),
+      rs |> transmute(
+        sample_id = sample, target,
+        rule_id   = "RV_MIXED_CQ",
+        outcome   = if_else(rv_mixed_na_num, "applied", "skipped"),
+        evidence  = paste0("n_num_cq=", n_num_cq, "; n_rows=", n_rows)
+      ),
+      # PASS_NEGATIVE — only rows where both Cq values were NA AND the target
+      # is NOT an always-positive target (those get RV_UNEXPECTED_NEG instead)
+      rs |> filter(pass_negative &
+                   !tolower(target) %in% tolower(always_pos_targets)) |>
+        transmute(
+        sample_id = sample, target,
+        rule_id   = "PASS_NEGATIVE",
+        outcome   = "pass",
+        evidence  = "Both Cq values are NA/NaN (true negative)"
+      ),
+      rs |> transmute(
+        sample_id = sample, target,
+        rule_id   = "RV_HIGH_SQ",
+        outcome   = if_else(rv_high_sq, "applied", "skipped"),
+        evidence  = paste0("avg_sq=", avg_sq, "; LOD_Hi=", LOD_Hi)
+      ),
+      rs |> filter(tolower(target) %in% tolower(always_pos_targets)) |>
+        transmute(
+          sample_id = sample, target,
+          rule_id   = "RV_UNEXPECTED_NEG",
+          outcome   = if_else(rv_unexpected_neg, "applied", "skipped"),
+          evidence  = if_else(
+            rv_unexpected_neg,
+            paste0("always_pos_target=TRUE; sub_type=", rv_unexpected_neg_sub,
+                   "; LOD_Lo=", LOD_Lo),
+            "always_pos_target=TRUE; group not negative"
+          )
+        )
+    )
 
-      log_decision(.$sample, .$target, "RV_DELTA_CQ",
-                   if (!is.na(.$delta_cq) && .$delta_cq > dCq_thr) "applied" else "skipped",
-                   paste0("|DeltaCq|=", .$delta_cq, "; thr=", dCq_thr),
-                   run_id, dec_log_path, file)
-
-      log_decision(.$sample, .$target, "RV_MIXED_CQ",
-                   if (.$rv_mixed_na_num) "applied" else "skipped",
-                   paste0("n_num_cq=", .$n_num_cq, "; n_rows=", .$n_rows),
-                   run_id, dec_log_path, file)
-
-      if (.$pass_negative)
-        log_decision(.$sample, .$target, "PASS_NEGATIVE", "pass",
-                     "Both Cq values are NA/NaN (true negative)",
-                     run_id, dec_log_path, file)
-
-      log_decision(.$sample, .$target, "RV_HIGH_SQ",
-                   if (.$rv_high_sq) "applied" else "skipped",
-                   paste0("avg_sq=", .$avg_sq, "; LOD_Hi=", LOD_Hi),
-                   run_id, dec_log_path, file)
-
-      tibble(.)
-    }) |>
-    invisible()
+    log_decisions_batch(
+      df           = step4_log,
+      run_id       = run_id,
+      dec_log_path = dec_log_path,
+      current_file = file
+    )
+  })
 
   pg_step_done(4, sprintf("%d replicate group(s) flagged for review", n_flagged))
   if (debug_print) { message("Table: rep_summary"); print(head(rep_summary)) }
@@ -1444,7 +2412,8 @@ process_plate <- function(file,
     left_join(
       rep_summary |> select(all_of(rep_key), delta_cq, avg_sq, both_cq_na,
                             rv_excess_reps, rv_single_rep, rv_delta_cq,
-                            rv_mixed_na_num, rv_high_sq),
+                            rv_mixed_na_num, rv_high_sq,
+                            rv_unexpected_neg, rv_unexpected_neg_sub),
       by = rep_key
     ) |>
     mutate(flag_name_mismatch = coalesce(flag_name_mismatch, FALSE))
@@ -1458,31 +2427,42 @@ process_plate <- function(file,
     "rv_single_rep",      "Only one replicate present",
     "rv_delta_cq",        "|DeltaCq| exceeds threshold",
     "rv_mixed_na_num",    "One Cq is NA/NaN and the other is numeric",
-    "rv_high_sq",         "AverageSQ > LOD_Hi"
+    "rv_high_sq",         "AverageSQ > LOD_Hi",
+    "rv_unexpected_neg",  "Unexpected negative for always-positive target"
   )
 
   review_cols <- c("rv_excess_reps", "flag_name_mismatch", "rv_single_rep",
-                   "rv_delta_cq", "rv_mixed_na_num", "rv_high_sq")
+                   "rv_delta_cq", "rv_mixed_na_num", "rv_high_sq",
+                   "rv_unexpected_neg")
 
   dat3 <- dat3 |>
     mutate(
       needs_review  = if_any(all_of(review_cols), ~ .x),
       review_reason = pmap_chr(
-        pick(all_of(review_cols)),
+        pick(all_of(c(review_cols, "rv_unexpected_neg_sub"))),
         function(...) {
-          flags_logical        <- c(...)
+          args                 <- list(...)
+          flags_logical        <- unlist(args[review_cols])
           names(flags_logical) <- review_cols
+          neg_sub              <- args[["rv_unexpected_neg_sub"]]
 
-          # rv_excess_reps overrides all other flags: Cq and SQ are blanked for
-          # these groups so there is nothing meaningful for the other checks to
-          # act on. Only the excess-reps reason is shown.
           if (isTRUE(flags_logical[["rv_excess_reps"]])) {
             return(reason_map$reason[reason_map$flag == "rv_excess_reps"])
           }
 
           flags <- review_cols[flags_logical]
           if (length(flags) == 0) return(NA_character_)
-          paste(reason_map$reason[match(flags, reason_map$flag)], collapse = " ; ")
+
+          reasons <- vapply(flags, function(f) {
+            base <- reason_map$reason[reason_map$flag == f]
+            # Append the sub-type for rv_unexpected_neg so the reason is self-explanatory
+            if (f == "rv_unexpected_neg" && !is.na(neg_sub))
+              paste0(base, " (", neg_sub, ")")
+            else
+              base
+          }, character(1))
+
+          paste(reasons, collapse = " ; ")
         }
       )
     )
@@ -1514,23 +2494,24 @@ process_plate <- function(file,
   # ----------------------------------------------------------
   log_variables(
     vars = list(
-      file           = file,
-      dCq_thr        = dCq_thr,
-      targets        = targets,   # NULL when scalar LODs were used
-      lod_hi         = LOD_Hi,
-      lod_lo         = LOD_Lo,
-      rm_patterns    = rm_patterns,
-      rm_cols_req    = rm_cols_req,
-      enable_preview = enable_preview,
-      dry_run        = dry_run,
-      debug_print    = debug_print,
-      output_dir     = output_dir,
-      dec_log_path   = dec_log_path,
-      var_log_path   = var_log_path
+      file                = file,
+      dCq_thr             = dCq_thr,
+      targets             = targets,   # NULL when scalar LODs were used
+      lod_hi              = LOD_Hi,
+      lod_lo              = LOD_Lo,
+      always_pos_targets  = always_pos_targets,
+      rm_patterns         = rm_patterns,
+      rm_cols_req         = rm_cols_req,
+      enable_preview      = enable_preview,
+      dry_run             = dry_run,
+      debug_print         = debug_print,
+      output_dir          = output_dir,
+      dec_log_path        = dec_log_path,
+      var_log_path        = var_log_path
     ),
     run_id       = run_id,
     var_log_path = var_log_path,
-    default_file = file
+    current_file = file
   )
 
   # ----------------------------------------------------------
@@ -1627,7 +2608,18 @@ plate_files <- if (!is.null(FILES)) {
 
 # Build and emit the file tree before any validation, so you can see
 # exactly what was found (or not found) even if something goes wrong below.
-tree_lines <- build_file_tree(plate_files, INPUT_DIR, SEARCH_DEPTH)
+# BUG-03: when FILES is supplied explicitly, use the common directory of those
+# files as the tree root rather than INPUT_DIR (which may not contain them).
+.tree_root <- if (!is.null(FILES) && length(plate_files) > 0) {
+  dirname(plate_files[[1]])
+} else {
+  INPUT_DIR
+}
+tree_lines <- build_file_tree(
+  plate_files,
+  .tree_root,
+  if (!is.null(FILES)) NA_integer_ else SEARCH_DEPTH
+)
 emit_file_tree(tree_lines, TREE_OUTPUT, TREE_PATH)
 
 if (length(plate_files) == 0) {
@@ -1647,13 +2639,19 @@ if (length(missing_files) > 0) {
 }
 
 # ----------------------------------------------------------
+# Pre-flight: validate TARGET_LOD consistency (REC-02).
+# Done before any interactive prompts so a misconfigured
+# Section 2 is caught immediately rather than mid-run.
+# ----------------------------------------------------------
+validate_target_lod(TARGET_LOD)
+
+# ----------------------------------------------------------
 # Log session-level variables once before the plate loop.
 # These are global settings that do not vary per plate, so
 # they are recorded here with a shared session run_id rather
 # than being passed into process_plate() individually.
 # ----------------------------------------------------------
 .session_run_id <- paste0("SESSION_", format(Sys.time(), "%Y%m%d_%H%M%S"))
-assign(".current_input_file", "(session)", envir = .GlobalEnv)
 
 log_variables(
   vars = list(
@@ -1673,7 +2671,7 @@ log_variables(
   ),
   run_id       = .session_run_id,
   var_log_path = VAR_LOG_PATH,
-  default_file = "(session)"
+  current_file = "(session)"
 )
 
 # ----------------------------------------------------------
@@ -1696,7 +2694,6 @@ if (isTRUE(SKIP_COMPLETED)) {
 
     # Log the Y/N decision (or the non-interactive fallback) for each skippable plate
     for (s in skippable) {
-      assign(".current_input_file", paste0(s, ".csv"), envir = .GlobalEnv)
       log_decision(
         sample_id    = NA,
         target       = NA,
@@ -1709,7 +2706,7 @@ if (isTRUE(SKIP_COMPLETED)) {
         ),
         run_id       = .session_run_id,
         dec_log_path = DEC_LOG_PATH,
-        default_file = paste0(s, ".csv")
+        current_file = paste0(s, ".csv")
       )
     }
 
@@ -1823,7 +2820,7 @@ if (isTRUE(STD_CHECK_ENABLED) && !is.null(N_STANDARDS) && N_STANDARDS > 0) {
 
   if (length(failing_info) > 0) {
 
-    std_action <- ask_standards_action(failing_info, N_STANDARDS, STD_FORCE_LOD)
+    std_action <- ask_standards_action(failing_info, N_STANDARDS, STD_FORCE_LOD, TARGET_LOD)
 
     # Process skip decisions
     if (length(std_action$skip_files) > 0) {
@@ -1845,13 +2842,18 @@ if (isTRUE(STD_CHECK_ENABLED) && !is.null(N_STANDARDS) && N_STANDARDS > 0) {
       std_force_lods <- std_action$force_lods
 
       for (fp in names(std_force_lods)) {
+        ftype <- std_action$force_type[[fp]] %||% "force_override"
+        notes_str <- if (!interactive()) {
+          "Non-interactive session: auto-forced with STD_FORCE_LOD"
+        } else if (ftype == "middle_confirmed") {
+          "User confirmed TARGET_LOD values via Y/N (middle standards only missing; endpoints intact)"
+        } else {
+          "User forced plate through with manual LOD override (endpoint standard missing)"
+        }
         log_standard_check(fp, N_STANDARDS, std_results[[fp]],
                            action       = "forced",
                            lod_override = std_force_lods[[fp]],
-                           notes        = if (!interactive())
-                             "Non-interactive session: auto-forced with STD_FORCE_LOD"
-                           else
-                             "User forced plate through with manual LOD override",
+                           notes        = notes_str,
                            run_id       = .session_run_id,
                            std_log_path = STD_LOG_PATH)
       }
@@ -1871,26 +2873,137 @@ if (length(plate_files) == 0) {
 }
 
 
+# ----------------------------------------------------------
+# Sample names pre-check
+# Reads every remaining plate file and checks whether the
+# entire Sample column is blank.  Plates where every sample
+# name is missing are shown to the user with a summary of
+# their Content values, then the user chooses to either:
+#   S — skip the plate entirely this run
+#   C — use the Content column as the Sample name
+#
+# When Content-as-Sample is chosen:
+#   - process_plate() substitutes Content → Sample before
+#     Step 0 runs, so the blank-name removal step sees zero
+#     blank rows and passes cleanly.
+#   - The substitution is flagged in the audit log with
+#     rule id SAMPLE_FROM_CONTENT and printed visibly during
+#     plate processing so the user can see it occurred.
+#   - The Source column in both output CSVs will reflect the
+#     Content values rather than an empty Sample field.
+#
+# Non-interactive default: skip all affected plates.
+# ----------------------------------------------------------
+sn_skipped_plates        <- character(0)  # stems removed by sample-names check
+sample_name_override_files <- character(0) # file paths where Content → Sample
+
+cat(sprintf(
+  "\n  Sample names check: scanning %d plate(s) for blank sample columns...\n",
+  length(plate_files)
+))
+
+sn_results <- lapply(plate_files, check_plate_sample_names)
+names(sn_results) <- plate_files
+
+blank_info <- list()
+for (fp in plate_files) {
+  res <- sn_results[[fp]]
+  if (!is.null(res$error)) {
+    # Read error — report but do not block; process_plate() will surface it properly
+    cat(sprintf("  [!] Could not check sample names for %s: %s\n",
+                file_stem(fp), res$error))
+  } else if (isTRUE(res$all_blank)) {
+    blank_info[[length(blank_info) + 1]] <- c(list(file = fp), res)
+  }
+}
+
+n_blank_plates <- length(blank_info)
+cat(sprintf("  Sample names check: %d plate(s) with fully blank sample column.\n",
+            n_blank_plates))
+
+if (n_blank_plates > 0) {
+
+  sn_action <- ask_sample_names_action(blank_info)
+
+  # --- Skip path ---
+  if (length(sn_action$skip_files) > 0) {
+    sn_skipped_plates <- file_stem(sn_action$skip_files)
+    plate_files       <- plate_files[!plate_files %in% sn_action$skip_files]
+
+    for (fp in sn_action$skip_files) {
+      log_decision(
+        sample_id    = NA,
+        target       = NA,
+        rule_id      = "SAMPLE_NAMES_BLANK_SKIP",
+        outcome      = "skipped",
+        evidence     = sprintf(
+          "All %d sample name(s) blank; user chose to skip%s",
+          sn_results[[fp]]$n_rows,
+          if (!interactive()) " (non-interactive default)" else ""
+        ),
+        run_id       = .session_run_id,
+        dec_log_path = DEC_LOG_PATH,
+        current_file = fp
+      )
+    }
+    cat(sprintf("\n  Sample names check: skipping %d plate(s); %d file(s) remaining.\n\n",
+                length(sn_skipped_plates), length(plate_files)))
+  }
+
+  # --- Content-as-sample path ---
+  if (length(sn_action$content_as_sample_files) > 0) {
+    sample_name_override_files <- sn_action$content_as_sample_files
+
+    for (fp in sample_name_override_files) {
+      log_decision(
+        sample_id    = NA,
+        target       = NA,
+        rule_id      = "SAMPLE_FROM_CONTENT",
+        outcome      = "applied",
+        evidence     = sprintf(
+          "All %d sample name(s) blank; user chose Content-as-Sample. Content values: %s",
+          sn_results[[fp]]$n_rows,
+          paste(sn_results[[fp]]$content_vals, collapse = ", ")
+        ),
+        run_id       = .session_run_id,
+        dec_log_path = DEC_LOG_PATH,
+        current_file = fp
+      )
+    }
+    cat(sprintf("  Sample names check: %d plate(s) will use Content as Sample name.\n\n",
+                length(sample_name_override_files)))
+  }
+}
+
+# Guard: nothing left after sample names filtering
+if (length(plate_files) == 0) {
+  cat("\n  0 file(s) remaining after sample names check — nothing to do.\n")
+  stop("No plates remaining after sample names check.", call. = FALSE)
+}
+
+
 # ============================================================
 # SECTION 9: Run Pipeline Across All Plates
 # ============================================================
 
 results <- lapply(seq_along(plate_files), function(i) {
   process_plate(
-    file           = plate_files[[i]],
-    LOD_List       = TARGET_LOD,           # Remove this line and set LOD_Lo / LOD_Hi
-    force_lod_list = std_force_lods[[plate_files[[i]]]],   # NULL unless standards-forced
-    dCq_thr        = DELTA_CQ_THRESHOLD,   # directly if not using per-target LODs
-    rm_patterns    = RM_PATTERNS,
-    rm_cols_req    = RM_COLUMNS,
-    plate_index    = i,
-    n_plates       = length(plate_files),
-    enable_preview = ENABLE_PREVIEW,
-    dry_run        = DRY_RUN,
-    debug_print    = DEBUG_PRINT,
-    output_dir     = OUTPUT_DIR,
-    dec_log_path   = DEC_LOG_PATH,
-    var_log_path   = VAR_LOG_PATH
+    file                = plate_files[[i]],
+    LOD_List            = TARGET_LOD,
+    force_lod_list      = std_force_lods[[plate_files[[i]]]],
+    dCq_thr             = DELTA_CQ_THRESHOLD,
+    rm_patterns         = RM_PATTERNS,
+    rm_cols_req         = RM_COLUMNS,
+    always_pos_targets  = ALWAYS_POSITIVE_TARGETS,
+    plate_index         = i,
+    n_plates            = length(plate_files),
+    enable_preview      = ENABLE_PREVIEW,
+    dry_run             = DRY_RUN,
+    debug_print         = DEBUG_PRINT,
+    output_dir          = OUTPUT_DIR,
+    dec_log_path        = DEC_LOG_PATH,
+    var_log_path        = VAR_LOG_PATH,
+    content_as_sample   = plate_files[[i]] %in% sample_name_override_files
   )
 })
 
@@ -1945,6 +3058,32 @@ if (length(std_skipped_plates) > 0) {
     dry_run      = NA
   )
   summary_tbl <- bind_rows(summary_tbl, std_skip_tbl)
+}
+
+if (length(sn_skipped_plates) > 0) {
+  sn_skip_tbl <- tibble(
+    plate        = sn_skipped_plates,
+    status       = "skipped (blank sample names)",
+    rows_in      = NA_integer_,
+    rows_out     = NA_integer_,
+    review       = NA_integer_,
+    elapsed_s    = NA_real_,
+    secs_per_row = NA_real_,
+    dry_run      = NA
+  )
+  summary_tbl <- bind_rows(summary_tbl, sn_skip_tbl)
+}
+
+if (length(sample_name_override_files) > 0) {
+  override_stems <- file_stem(sample_name_override_files)
+  # These plates were processed normally — update their status in the table
+  # to make the Content-as-Sample substitution visible in the summary.
+  summary_tbl <- summary_tbl |>
+    mutate(status = if_else(
+      plate %in% override_stems & status == "processed",
+      "processed (Content used as Sample name)",
+      status
+    ))
 }
 
 print(summary_tbl)
