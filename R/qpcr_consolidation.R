@@ -25,39 +25,48 @@
 #    install.packages(c("tidyverse", "openxlsx"))
 # ============================================================
 
-SCRIPT_VERSION <- "0.2.0"
+if (!exists("SCRIPT_VERSION")) {
+  source("get_version.R")
+  status <- verify_pipeline_integrity()
+  SCRIPT_VERSION <- status$version
+  
+  message("--------------------------------------------------")
+  message(" Running qPCR Pipeline Version: ", status$version)
+  message(" Integrity Check: ", if(status$integrity_passed) "PASSED" else "MODIFIED️")
+  message("--------------------------------------------------")
+}
 
 # ============================================================
 # SECTION 1: Configuration
 # ============================================================
 
 # --- Input ---
-INPUT_DIR <- "outputs/"   # OUTPUT_DIR from the cleaning pipeline.
+if (!exists("INPUT_DIR"))          INPUT_DIR <- "outputs/"   # OUTPUT_DIR from the cleaning pipeline.
 
 # Regex patterns used to identify the two CSV types in INPUT_DIR.
 # Change these only if the cleaning pipeline output filenames differ.
-ALL_PATTERN    <- "_all_samples\\.csv$"
-REVIEW_PATTERN <- "_review_samples\\.csv$"
+if (!exists("ALL_PATTERN"))        ALL_PATTERN    <- "_all_samples\\.csv$"
+if (!exists("REVIEW_PATTERN"))     REVIEW_PATTERN <- "_review_samples\\.csv$"
 
 # --- Output ---
 # Folder where consolidated workbooks are written (created if missing).
-CONSOLIDATION_DIR <- "consolidated"
+if (!exists("CONSOLIDATION_DIR"))  CONSOLIDATION_DIR <- "consolidated"
 
-ALL_OUT_PATH    <- file.path(CONSOLIDATION_DIR, "qpcr_all_samples.xlsx")
-REVIEW_OUT_PATH <- file.path(CONSOLIDATION_DIR, "qpcr_review_samples.xlsx")
+if (!exists("ALL_OUT_PATH"))       ALL_OUT_PATH    <- file.path(CONSOLIDATION_DIR, "qpcr_all_samples.xlsx")
+if (!exists("REVIEW_OUT_PATH"))    REVIEW_OUT_PATH <- file.path(CONSOLIDATION_DIR, "qpcr_review_samples.xlsx")
 
 # --- Excel formatting ---
-TABLE_STYLE <- "TableStyleMedium2"  # Excel built-in table style (header + alt rows).
-FONT_NAME   <- "Arial"              # Font applied to all data cells.
-FONT_SIZE   <- 10                   # Font size (pt).
+if (!exists("TABLE_STYLE"))        TABLE_STYLE <- "TableStyleMedium2"  # Excel built-in table style (header + alt rows).
+if (!exists("FONT_NAME"))          FONT_NAME   <- "Arial"              # Font applied to all data cells.
+if (!exists("FONT_SIZE"))          FONT_SIZE   <- 10                   # Font size (pt).
 
 # Minimum column width (characters).  "auto" sizes to content but can be very
 # narrow for sparse columns; this floor keeps them readable.
-COL_WIDTH_MIN <- 10
+if (!exists("COL_WIDTH_MIN"))      COL_WIDTH_MIN <- 10
 
 # --- Write retry (for network / server paths) ---
-MAX_WRITE_TRIES <- 5   # Maximum attempts before giving up.
-WAIT_SECS       <- 3   # Seconds to wait between retry attempts.
+if (!exists("MAX_WRITE_TRIES"))    MAX_WRITE_TRIES <- 5   # Maximum attempts before giving up.
+if (!exists("WAIT_SECS"))          WAIT_SECS       <- 3   # Seconds to wait between retry attempts.
 
 # --- Target alias mapping ---
 # Defines groups of target names that should be treated as the same target
@@ -73,11 +82,13 @@ WAIT_SECS       <- 3   # Seconds to wait between retry attempts.
 #
 # To add a new alias group, add another entry following the same pattern.
 # To disable alias mapping entirely, set TARGET_ALIASES <- list()
-TARGET_ALIASES <- list(
-  uni = c("uni", "universal", "univ")
-  # Add further groups as needed, e.g.:
-  # speb = c("speb", "spec_b", "specb")
-)
+if (!exists("TARGET_ALIASES")) {
+  TARGET_ALIASES <- list(
+    uni = c("uni", "universal", "univ")
+    # Add further groups as needed, e.g.:
+    # speb = c("speb", "spec_b", "specb")
+  )
+}
 
 # Controls what appears in the Target column of the OUTPUT DATA ROWS
 # after alias resolution:
@@ -87,7 +98,7 @@ TARGET_ALIASES <- list(
 #   FALSE — preserve the original value from the source file (rows
 #           keep "universal" or "uni" as written, but both land on the
 #           same sheet)
-UPDATE_TARGET_TO_CANONICAL <- TRUE
+if (!exists("UPDATE_TARGET_TO_CANONICAL")) UPDATE_TARGET_TO_CANONICAL <- TRUE
 
 # --- Audit directory ---
 # Location of the audit/ folder written by the cleaning pipeline.
@@ -95,12 +106,12 @@ UPDATE_TARGET_TO_CANONICAL <- TRUE
 # Defaults to "audit/" relative to the working directory; change if your
 # audit files live elsewhere (e.g. a shared network path).
 # Set to NULL to skip the audit summary entirely.
-AUDIT_DIR <- "audit/"
+if (!exists("AUDIT_DIR"))          AUDIT_DIR <- "audit/"
 
 # --- Run log ---
 # Plain-text transcript of all console output for this run.
 # Set to NULL to disable.
-CONSOLIDATION_LOG_PATH <- "audit/pcr_consolidation_log.txt"
+if (!exists("CONSOLIDATION_LOG_PATH")) CONSOLIDATION_LOG_PATH <- "audit/pcr_consolidation_log.txt"
 
 
 # ============================================================

@@ -19,7 +19,16 @@
 #    install.packages("tidyverse")   # tidyverse >= 2.0 required
 # ============================================================
 
-SCRIPT_VERSION <- "0.2.0"
+if (!exists("SCRIPT_VERSION")) {
+  source("get_version.R")
+  status <- verify_pipeline_integrity()
+  SCRIPT_VERSION <- status$version
+  
+  message("--------------------------------------------------")
+  message(" Running qPCR Pipeline Version: ", status$version)
+  message(" Integrity Check: ", if(status$integrity_passed) "PASSED" else "MODIFIED️")
+  message("--------------------------------------------------")
+}
 
 # ============================================================
 # SECTION 1: Configuration
@@ -28,14 +37,14 @@ SCRIPT_VERSION <- "0.2.0"
 # to edit anything outside Sections 1 and 2.
 
 # --- Input ---
-INPUT_DIR    <- "RawData/"   # Folder containing plate CSV files.
-FILE_PATTERN <- "\\.csv$"    # Regex: which files to include (matched against filename).
-FILES        <- NULL         # Optional: explicit character vector of file paths.
+if (!exists("INPUT_DIR"))           INPUT_DIR    <- "RawData/"   # Folder containing plate CSV files.
+if (!exists("FILE_PATTERN"))        FILE_PATTERN <- "\\.csv$"    # Regex: which files to include (matched against filename).
+if (!exists("FILES"))               FILES        <- NULL         # Optional: explicit character vector of file paths.
 # If set, INPUT_DIR, FILE_PATTERN, and SEARCH_DEPTH
 # are all ignored.
 # e.g. FILES <- c("data_raw/plate1.csv", "data_raw/plate2.csv")
 
-SEARCH_DEPTH <- 2            # How many subfolder levels to search within INPUT_DIR.
+if (!exists("SEARCH_DEPTH"))        SEARCH_DEPTH <- 2            # How many subfolder levels to search within INPUT_DIR.
 #   0 = only files directly inside INPUT_DIR
 #   1 = INPUT_DIR + one level of subfolders
 #   2 = INPUT_DIR + two levels of subfolders, etc.
@@ -45,32 +54,32 @@ SEARCH_DEPTH <- 2            # How many subfolder levels to search within INPUT_
 # --- File tree ---
 # A tree of all matching files found is produced before processing begins.
 # It shows the folder structure and which files will be processed.
-TREE_OUTPUT  <- "both"                 # Where to send the tree: "console", "file", or "both".
-TREE_PATH    <- "audit/file_tree.txt"  # Destination when TREE_OUTPUT is "file" or "both".
+if (!exists("TREE_OUTPUT"))         TREE_OUTPUT  <- "both"                 # Where to send the tree: "console", "file", or "both".
+if (!exists("TREE_PATH"))           TREE_PATH    <- "audit/file_tree.txt"  # Destination when TREE_OUTPUT is "file" or "both".
 
 # --- Output ---
-OUTPUT_DIR   <- "outputs"                  # Folder for cleaned CSVs.
-DEC_LOG_PATH <- "audit/pcr_decisions.csv"  # Audit log: one row per QC decision.
-VAR_LOG_PATH <- "audit/pcr_variables.csv"  # Audit log: parameters used per run.
+if (!exists("OUTPUT_DIR"))          OUTPUT_DIR   <- "outputs"                  # Folder for cleaned CSVs.
+if (!exists("DEC_LOG_PATH"))        DEC_LOG_PATH <- "audit/pcr_decisions.csv"  # Audit log: one row per QC decision.
+if (!exists("VAR_LOG_PATH"))        VAR_LOG_PATH <- "audit/pcr_variables.csv"  # Audit log: parameters used per run.
 
 # --- QC Thresholds ---
-DELTA_CQ_THRESHOLD <- 1.0  # Max acceptable |Cq replicate difference|.
+if (!exists("DELTA_CQ_THRESHOLD"))  DELTA_CQ_THRESHOLD <- 1.0  # Max acceptable |Cq replicate difference|.
 # Pairs exceeding this are flagged for review.
 
 # --- Optional: Remove rows whose sample/content values match a pattern ---
 # Any row where a value in RM_COLUMNS matches any pattern in RM_PATTERNS
 # will be removed. Matching is case-insensitive.
-RM_PATTERNS <- c("Std", "NTC", "Neg")  # Regex patterns to match.
-RM_COLUMNS  <- c("sample")                    # Which columns to search in.
+if (!exists("RM_PATTERNS"))         RM_PATTERNS <- c("Std", "NTC", "Neg")  # Regex patterns to match.
+if (!exists("RM_COLUMNS"))          RM_COLUMNS  <- c("sample")                    # Which columns to search in.
 
 # Set to TRUE to print a table of matched rows before removing them.
-ENABLE_PREVIEW <- FALSE
+if (!exists("ENABLE_PREVIEW"))      ENABLE_PREVIEW <- FALSE
 
 # Set to TRUE to skip the actual removal step (log only — useful for testing).
-DRY_RUN <- FALSE
+if (!exists("DRY_RUN"))             DRY_RUN <- FALSE
 
 # Set to TRUE to print intermediate data frames to the console (for debugging).
-DEBUG_PRINT <- FALSE
+if (!exists("DEBUG_PRINT"))         DEBUG_PRINT <- FALSE
 
 # --- Resume / skip completed plates ---
 # Set to TRUE to check whether output CSVs already exist for each plate before
@@ -79,7 +88,7 @@ DEBUG_PRINT <- FALSE
 # will be asked whether to skip them (Y) or reprocess them (N).
 # If the script is run non-interactively (e.g. scheduled via Rscript), it
 # defaults to N — reprocess everything — and logs that no prompt was possible.
-SKIP_COMPLETED <- TRUE
+if (!exists("SKIP_COMPLETED"))      SKIP_COMPLETED <- TRUE
 
 # --- Standards check ---
 # Before any data is removed, checks that every expected standard is present
@@ -91,8 +100,8 @@ SKIP_COMPLETED <- TRUE
 # no standards are actually missing.
 # Plates with missing standards are gathered and you will be asked whether
 # to skip them or force them through with manually specified LOD overrides.
-STD_CHECK_ENABLED <- TRUE   # Set to FALSE to bypass the check entirely.
-N_STANDARDS       <- 6      # How many standards to expect (Std-001 … Std-006).
+if (!exists("STD_CHECK_ENABLED"))   STD_CHECK_ENABLED <- TRUE   # Set to FALSE to bypass the check entirely.
+if (!exists("N_STANDARDS"))         N_STANDARDS       <- 6      # How many standards to expect (Std-001 … Std-006).
 # Standards are split into Hi/Lo halves for LOD prompting:
 #   Hi half : Std-001 … Std-floor(N_STANDARDS/2)       — governs LOD Hi
 #   Lo half : Std-(floor(N_STANDARDS/2)+1) … Std-NNN   — governs LOD Lo
@@ -110,7 +119,7 @@ N_STANDARDS       <- 6      # How many standards to expect (Std-001 … Std-006)
 # all targets to share the same LOD values).  The list keys below must still
 # name each target so the lookup succeeds, but all values within LOD_Hi (and
 # within LOD_Lo) should be identical.
-STD_FORCE_LOD <- NULL
+if (!exists("STD_FORCE_LOD"))       STD_FORCE_LOD <- NULL
 # Example:
 # STD_FORCE_LOD <- list(
 #   LOD_Hi = list(nuc = 2000, lyta = 2000, copb = 2000),  # all equal
@@ -118,7 +127,7 @@ STD_FORCE_LOD <- NULL
 # )
 
 # Separate audit log that records the outcome of every standards check.
-STD_LOG_PATH <- "audit/pcr_standards.csv"
+if (!exists("STD_LOG_PATH"))        STD_LOG_PATH <- "audit/pcr_standards.csv"
 
 # --- Run log ---
 # A plain-text transcript of all console output produced during the run.
@@ -129,7 +138,7 @@ STD_LOG_PATH <- "audit/pcr_standards.csv"
 # NOTE: if the script exits with an ERROR before reaching the end, the
 # sink may be left open and further R console output will not display.
 # To recover, run  sink()  once in the R console.
-RUN_LOG_PATH <- "audit/pcr_run_log.txt"
+if (!exists("RUN_LOG_PATH"))        RUN_LOG_PATH <- "audit/pcr_run_log.txt"
 
 
 # ============================================================
@@ -142,47 +151,48 @@ RUN_LOG_PATH <- "audit/pcr_run_log.txt"
 # LOD_Lo and LOD_Hi as single scalars in process_plate() directly,
 # but the list approach here allows per-target flexibility.
 
-TARGET_LOD <- list(
-  LOD_Hi = list(
-    hi_fucp   = 2000,
-    fucp   = 2000,
-    `hi-fucp` = 2000,
-    `hi fucp` = 2000,
-    hi_hpd3   = 2000,
-    `hi-hpd3` = 2000,
-    hpd3      = 2000,
-    lyta      = 2000,
-    copb      = 2000,
-    speb      = 2000,
-    nuc       = 2000,
-    gyrb      = 2000,
-    uni       = 200,
-    univ      = 200,
-    universal = 200,
-    hh_hpd3   = 2000,
-    hh_hypd   = 2000
-  ),
-  LOD_Lo = list(
-    hi_fucp   = 0.012,
-    fucp   = 0.012,
-    `hi-fucp` = 0.012,
-    `hi fucp` = 0.012,
-    hi_hpd3   = 0.012,
-    `hi-hpd3` = 0.012,
-    hpd3      = 0.012,
-    lyta      = 0.012,
-    copb      = 0.012,
-    speb      = 0.012,
-    nuc       = 0.012,
-    gyrb      = 0.012,
-    uni       = 0.0012,
-    univ      = 0.0012,
-    universal = 0.0012,
-    hh_hpd3   = 0.012,
-    hh_hypd   = 0.012
+if (!exists("TARGET_LOD")) {
+  TARGET_LOD <- list(
+    LOD_Hi = list(
+      hi_fucp   = 2000,
+      fucp   = 2000,
+      `hi-fucp` = 2000,
+      `hi fucp` = 2000,
+      hi_hpd3   = 2000,
+      `hi-hpd3` = 2000,
+      hpd3      = 2000,
+      lyta      = 2000,
+      copb      = 2000,
+      speb      = 2000,
+      nuc       = 2000,
+      gyrb      = 2000,
+      uni       = 200,
+      univ      = 200,
+      universal = 200,
+      hh_hpd3   = 2000,
+      hh_hypd   = 2000
+    ),
+    LOD_Lo = list(
+      hi_fucp   = 0.012,
+      fucp   = 0.012,
+      `hi-fucp` = 0.012,
+      `hi fucp` = 0.012,
+      hi_hpd3   = 0.012,
+      `hi-hpd3` = 0.012,
+      hpd3      = 0.012,
+      lyta      = 0.012,
+      copb      = 0.012,
+      speb      = 0.012,
+      nuc       = 0.012,
+      gyrb      = 0.012,
+      uni       = 0.0012,
+      univ      = 0.0012,
+      universal = 0.0012,
+      hh_hpd3   = 0.012,
+      hh_hypd   = 0.012
+    )
   )
-)
-
+}
 
 # Targets that are expected to always produce a detectable result.
 # If a replicate group for one of these targets has ALL replicates adjusted
@@ -195,11 +205,12 @@ TARGET_LOD <- list(
 #
 # Keys must be lowercase and match the target names in your CSV files.
 # Set to NULL or character(0) to disable the check entirely.
-ALWAYS_POSITIVE_TARGETS <- c("uni", "univ", "universal"
-  # Add targets that should always amplify, e.g.:
-  # "nuc", "lyta", "gyrb"
-)
-
+if (!exists("ALWAYS_POSITIVE_TARGETS")) {
+  ALWAYS_POSITIVE_TARGETS <- c("uni", "univ", "universal"
+    # Add targets that should always amplify, e.g.:
+    # "nuc", "lyta", "gyrb"
+  )
+}
 
 # ============================================================
 # SECTION 3: Library Import

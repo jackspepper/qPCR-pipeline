@@ -1,6 +1,21 @@
 # Changelog
 
-## 0.2.0 — current
+## 0.2.1-dev - current
+
+### cleaning and consolidation pipeline
+- Adjusted scripts to be accessible via source(), allowing for use in automation scripts or as standalones
+
+### qcr_pipeline.R
+- New script that allows for reproducible scripts that make variable adjustment easier without having to modify the script files themselves
+- A defaults.md file have been created to provide an easier reference for what the script defaults are when adjusting the pipeline script
+
+### get_version.R
+- Script that gets the git version of the scripts used, defaulting to the CHANGELOG.md if offline, and unknown if either 
+
+### General
+- user_guide.md is presently outdated and will need updated prior to merging with main
+
+## 0.2.0
 
 ### Cleaning pipeline
 - Standards pre-check with interactive LOD override prompts
