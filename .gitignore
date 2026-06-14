@@ -1,0 +1,30 @@
+# History files
+.Rhistory
+.Rapp.history
+
+# Session Data files
+.RData
+.RDataTmp
+
+# User-specific files
+.Ruserdata
+.Rproj.user/
+
+# Pipeline-generated outputs
+outputs/
+consolidated/
+audit/
+
+# Ignore raw data files to prevent uploading large biological datasets
+# But keep the templates/example_project/RawData folder structure
+templates/example_project/RawData/*.csv
+templates/example_project/RawData/*.xlsx
+
+# renv package manager folders
+renv/library/
+renv/local/
+renv/staging/
+
+# OS-specific files
+Thumbs.db
+.DS_Store

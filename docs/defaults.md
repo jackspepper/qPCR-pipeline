@@ -12,29 +12,28 @@ Script: [qpcr_cleaning_pipeline.R](../R/qpcr_cleaning_pipeline.R)
 
 | Variable                | Value                         |
 |-------------------------|-------------------------------|
-| SCRIPT_VERSION          | Calculated at script run      |
-| INPUT_DIR               | "RawData/"                    |
-| FILE_PATTERN            | "\\.csv\$"                    |
-| FILES                   | NULL                          |
-| SEARCH_DEPTH            | 2                             |
-| TREE_OUTPUT             | "both"                        |
-| TREE_PATH               | "audit/file_tree.txt"         |
-| OUTPUT_DIR              | "outputs"                     |
-| DEC_LOG_PATH            | "audit/pcr_decisions.csv"     |
-| VAR_LOG_PATH            | "audit/pcr_variables.csv"     |
-| DELTA_CQ_THRESHOLD      | 1.0                           |
-| RM_PATTERNS             | c("Std", "NTC", "Neg")        |
-| RM_COLUMNS              | c("sample")                   |
-| ENABLE_PREVIEW          | FALSE                         |
-| DRY_RUN                 | FALSE                         |
-| DEBUG_PRINT             | FALSE                         |
-| SKIP_COMPLETED          | TRUE                          |
-| STD_CHECK_ENABLED       | TRUE                          |
-| N_STANDARDS             | 6                             |
-| STD_FORCE_LOD           | NULL                          |
-| STD_LOG_PATH            | "audit/pcr_standards.csv"     |
-| RUN_LOG_PATH            | "audit/pcr_run_log.txt"       |
-| ALWAYS_POSITIVE_TARGETS | c("uni", "univ", "universal") |
+| input_dir               | "RawData/"                    |
+| file_pattern            | "\\.csv\$"                    |
+| files                   | NULL                          |
+| search_depth            | 2                             |
+| tree_output             | "both"                        |
+| tree_path               | "audit/file_tree.txt"         |
+| output_dir              | "outputs"                     |
+| dec_log_path            | "audit/pcr_decisions.csv"     |
+| var_log_path            | "audit/pcr_variables.csv"     |
+| delta_cq_threshold      | 1.0                           |
+| rm_patterns             | c("Std", "NTC", "Neg")        |
+| rm_columns              | c("sample")                   |
+| enable_preview          | FALSE                         |
+| dry_run                 | FALSE                         |
+| debug_print             | FALSE                         |
+| skip_completed          | TRUE                          |
+| std_check_enabled       | TRUE                          |
+| n_standards             | 6                             |
+| std_force_lod           | NULL                          |
+| std_log_path            | "audit/pcr_standards.csv"     |
+| run_log_path            | "audit/pcr_run_log.txt"       |
+| always_positive_targets | c("uni", "univ", "universal") |
 
 ### Targets
 
@@ -55,8 +54,7 @@ Script: [qpcr_consolidation.R](../R/qpcr_consolidation.R)
 
 | Variable                   | Value                                                    |
 |----------------------------|----------------------------------------------------------|
-| SCRIPT_VERSION             | Calculated at script run                                 |
-| INPUT_DIR                  | "outputs/"                                               |
+| input_dir                  | "outputs/"                                               |
 | ALL_PATTERN                | "\_all_samples\\.csv\$"                                  |
 | REVIEW_PATTERN             | "\_review_samples\\.csv\$"                               |
 | CONSOLIDATION_DIR          | "consolidated"                                           |

@@ -1,6 +1,22 @@
 # Changelog
 
-## 0.2.1-dev - current
+## 0.3.0-dev - current
+
+### R Package Refactoring
+- Converted script-based repository into an installable R package (`qpcrpipeline`).
+- Exposed core pipelines as exportable functions: `run_cleaning_pipeline()` and `run_consolidation_pipeline()`.
+- Designed pipeline functions to return directory paths to enable native R (`|>`) and `magrittr` (`%>%`) piping.
+- Added `use_qpcr_template()` to dynamically bootstrap new project folders with raw data structures and runner scripts.
+- Removed obsolete version check script (`R/get_version.R`) and replaced with standard R package versioning via `DESCRIPTION`.
+- Relocated example files to package assets (`inst/example_project/`).
+
+### GitHub & Infrastructure
+- Created standard R `.gitignore` to prevent committing local RStudio caches, packages, logs, and biological datasets.
+- Created `qPCR-pipeline.Rproj` to automatically set the working directory to the project root in RStudio.
+- Added GitHub Actions CI/CD workflow (`.github/workflows/run-tests.yml`) to build, install, and test the package on example data.
+- Added templates for Bug Reports, Feature Requests, and Pull Requests.
+
+## 0.2.1
 
 ### cleaning and consolidation pipeline
 - Adjusted scripts to be accessible via source(), allowing for use in automation scripts or as standalones

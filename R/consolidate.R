@@ -1,154 +1,8 @@
 # ============================================================
-#  qPCR Results Consolidation
-#  Complementary to qpcr_cleaning_pipeline.R
-#
-#  PURPOSE:
-#    Reads all _all_samples.csv and _review_samples.csv files
-#    produced by the cleaning pipeline from INPUT_DIR, adds
-#    metadata columns (File Name, Date, Plate#), then writes
-#    two Excel workbooks — one per output type — with each
-#    target as a separate sheet:
-#      - <ALL_OUT_PATH>    : all cleaned rows, one sheet per target
-#      - <REVIEW_OUT_PATH> : review-flagged rows, one sheet per target
-#
-#  USAGE:
-#    1. Set INPUT_DIR to match OUTPUT_DIR from the cleaning pipeline.
-#    2. Set ALL_OUT_PATH and REVIEW_OUT_PATH for your desired locations.
-#    3. Run the whole script (source() or Ctrl+Shift+Enter in RStudio).
-#
-#  If either output workbook already exists you will be prompted to:
-#    O = Overwrite   — discard existing workbook and rebuild from scratch
-#    A = Append      — merge new data into the existing workbook
-#    N = New file    — keep existing workbook and save under a new name
-#
-#  DEPENDENCIES:
-#    install.packages(c("tidyverse", "openxlsx"))
+#  qPCR Results Consolidation - R Package Version
 # ============================================================
 
-if (!exists("SCRIPT_VERSION")) {
-  source("get_version.R")
-  status <- verify_pipeline_integrity()
-  SCRIPT_VERSION <- status$version
-  
-  message("--------------------------------------------------")
-  message(" Running qPCR Pipeline Version: ", status$version)
-  message(" Integrity Check: ", if(status$integrity_passed) "PASSED" else "MODIFIED️")
-  message("--------------------------------------------------")
-}
-
-# ============================================================
-# SECTION 1: Configuration
-# ============================================================
-
-# --- Input ---
-if (!exists("INPUT_DIR"))          INPUT_DIR <- "outputs/"   # OUTPUT_DIR from the cleaning pipeline.
-
-# Regex patterns used to identify the two CSV types in INPUT_DIR.
-# Change these only if the cleaning pipeline output filenames differ.
-if (!exists("ALL_PATTERN"))        ALL_PATTERN    <- "_all_samples\\.csv$"
-if (!exists("REVIEW_PATTERN"))     REVIEW_PATTERN <- "_review_samples\\.csv$"
-
-# --- Output ---
-# Folder where consolidated workbooks are written (created if missing).
-if (!exists("CONSOLIDATION_DIR"))  CONSOLIDATION_DIR <- "consolidated"
-
-if (!exists("ALL_OUT_PATH"))       ALL_OUT_PATH    <- file.path(CONSOLIDATION_DIR, "qpcr_all_samples.xlsx")
-if (!exists("REVIEW_OUT_PATH"))    REVIEW_OUT_PATH <- file.path(CONSOLIDATION_DIR, "qpcr_review_samples.xlsx")
-
-# --- Excel formatting ---
-if (!exists("TABLE_STYLE"))        TABLE_STYLE <- "TableStyleMedium2"  # Excel built-in table style (header + alt rows).
-if (!exists("FONT_NAME"))          FONT_NAME   <- "Arial"              # Font applied to all data cells.
-if (!exists("FONT_SIZE"))          FONT_SIZE   <- 10                   # Font size (pt).
-
-# Minimum column width (characters).  "auto" sizes to content but can be very
-# narrow for sparse columns; this floor keeps them readable.
-if (!exists("COL_WIDTH_MIN"))      COL_WIDTH_MIN <- 10
-
-# --- Write retry (for network / server paths) ---
-if (!exists("MAX_WRITE_TRIES"))    MAX_WRITE_TRIES <- 5   # Maximum attempts before giving up.
-if (!exists("WAIT_SECS"))          WAIT_SECS       <- 3   # Seconds to wait between retry attempts.
-
-# --- Target alias mapping ---
-# Defines groups of target names that should be treated as the same target
-# and consolidated onto a single sheet.
-#
-# Structure: each entry is a named character vector where:
-#   - The NAME  is the canonical (final) sheet name that will appear in Excel
-#   - The VALUE is a character vector of ALL aliases for that target,
-#     including the canonical name itself
-#
-# Matching is case-insensitive (targets are already lowercased before
-# alias resolution runs).
-#
-# To add a new alias group, add another entry following the same pattern.
-# To disable alias mapping entirely, set TARGET_ALIASES <- list()
-if (!exists("TARGET_ALIASES")) {
-  TARGET_ALIASES <- list(
-    uni = c("uni", "universal", "univ")
-    # Add further groups as needed, e.g.:
-    # speb = c("speb", "spec_b", "specb")
-  )
-}
-
-# Controls what appears in the Target column of the OUTPUT DATA ROWS
-# after alias resolution:
-#
-#   TRUE  — update Target to the canonical name (all "universal" rows
-#           become "uni" in the sheet data)
-#   FALSE — preserve the original value from the source file (rows
-#           keep "universal" or "uni" as written, but both land on the
-#           same sheet)
-if (!exists("UPDATE_TARGET_TO_CANONICAL")) UPDATE_TARGET_TO_CANONICAL <- TRUE
-
-# --- Audit directory ---
-# Location of the audit/ folder written by the cleaning pipeline.
-# Used to read the decision log and standards log for the run_summary sheet.
-# Defaults to "audit/" relative to the working directory; change if your
-# audit files live elsewhere (e.g. a shared network path).
-# Set to NULL to skip the audit summary entirely.
-if (!exists("AUDIT_DIR"))          AUDIT_DIR <- "audit/"
-
-# --- Run log ---
-# Plain-text transcript of all console output for this run.
-# Set to NULL to disable.
-if (!exists("CONSOLIDATION_LOG_PATH")) CONSOLIDATION_LOG_PATH <- "audit/pcr_consolidation_log.txt"
-
-
-# ============================================================
-# SECTION 2: Library Import
-# ============================================================
-
-library(tidyverse)
-library(openxlsx)
-
-options(dplyr.show_progress = FALSE)
-options(readr.show_progress = FALSE)
-options(vroom.show_progress = FALSE)
-
-# Runtime dependency version guards (REC-05).
-# Catches silent failures from older package versions lacking required functions.
-local({
-  need <- list(dplyr = "1.1.0", tidyr = "1.3.0", purrr = "1.0.0",
-               readr = "2.0.0", stringr = "1.5.0", openxlsx = "4.2.0")
-  for (pkg in names(need)) {
-    ver <- tryCatch(packageVersion(pkg), error = function(e) NULL)
-    if (is.null(ver))
-      stop(pkg, " is not installed. Run: install.packages(c('tidyverse','openxlsx'))",
-           call. = FALSE)
-    if (ver < need[[pkg]])
-      stop(pkg, " >= ", need[[pkg]], " required (installed: ", ver, ").\n",
-           "  Run: install.packages(c('tidyverse','openxlsx'))", call. = FALSE)
-  }
-})
-# NOTE (RISK-05): build_decision_summary() and build_standards_summary() both
-# filter audit rows to the most recent run_id using lexicographic max().
-# This works because plate-level run_ids ("YYYYMMDD_HHMMSS_<stem>") are always
-# lexicographically greater than session-level ids ("SESSION_YYYYMMDD_HHMMSS").
-# If the run_id format changes this assumption must be revisited.
-
-# ============================================================
-# SECTION 3: Utility Helpers
-# ============================================================
+# Version and config parameters are now handled by package function arguments.
 
 # --- Console ruler width (matches cleaning pipeline) ---
 .pg_width <- 60
@@ -378,39 +232,40 @@ build_count_pivot <- function(data) {
 #   review_counts : output of build_count_pivot(review_data), or NULL
 # ----------------------------------------------------------
 add_summary_sheet <- function(wb, decision_wide, standards_tbl,
-                              all_counts, review_counts) {
+                              all_counts, review_counts,
+                              font_name, font_size, col_width_min) {
 
   sn <- "run_summary"
   addWorksheet(wb, sheetName = sn)
 
   # ---- Styles ----
   section_style <- createStyle(
-    fontName       = FONT_NAME,
-    fontSize       = FONT_SIZE + 1L,
+    fontName       = font_name,
+    fontSize       = font_size + 1L,
     textDecoration = "bold",
     fgFill         = "#B8CCE4",          # light steel blue
     border         = "Bottom",
     borderColour   = "#2E5F8A"
   )
   header_style <- createStyle(
-    fontName       = FONT_NAME,
-    fontSize       = FONT_SIZE,
+    fontName       = font_name,
+    fontSize       = font_size,
     textDecoration = "bold",
     fgFill         = "#4472C4",          # medium blue
     fontColour     = "#FFFFFF"
   )
   data_style <- createStyle(
-    fontName = FONT_NAME,
-    fontSize = FONT_SIZE
+    fontName = font_name,
+    fontSize = font_size
   )
   int_style <- createStyle(
-    fontName = FONT_NAME,
-    fontSize = FONT_SIZE,
+    fontName = font_name,
+    fontSize = font_size,
     numFmt   = "0"
   )
   notice_style <- createStyle(
-    fontName      = FONT_NAME,
-    fontSize      = FONT_SIZE,
+    fontName      = font_name,
+    fontSize      = font_size,
     fontColour    = "#7F7F7F",
     textDecoration = "italic"
   )
@@ -516,7 +371,7 @@ add_summary_sheet <- function(wb, decision_wide, standards_tbl,
     hdrs <- vapply(all_tbls, function(tbl) {
       if (ncol(tbl) >= j) nchar(names(tbl)[[j]]) else 0L
     }, integer(1L))
-    max(COL_WIDTH_MIN, max(hdrs))
+    max(col_width_min, max(hdrs))
   }, numeric(1L))
 
   setColWidths(wb, sn,
@@ -776,9 +631,78 @@ prompt_file_action <- function(path, label) {
 }
 
 
-# ============================================================
-# SECTION 4: Open Run Log Sink
-# ============================================================
+#' Run the qPCR Consolidation Pipeline
+#'
+#' Gathers cleaned CSV output files into structured Excel workbooks.
+#'
+#' @param input_dir Folder containing cleaned CSVs (defaults to "outputs").
+#' @param all_pattern Regex pattern used to identify "all_samples" CSV files.
+#' @param review_pattern Regex pattern used to identify "review_samples" CSV files.
+#' @param consolidation_dir Folder where consolidated workbooks are written.
+#' @param all_out_path Output path for all-samples consolidated Excel workbook.
+#' @param review_out_path Output path for review-flagged consolidated Excel workbook.
+#' @param table_style Excel built-in table style applied to data tables.
+#' @param font_name Font name applied to Excel cells.
+#' @param font_size Font size in points.
+#' @param col_width_min Minimum column width in Excel.
+#' @param max_write_tries Maximum save attempts before giving up.
+#' @param wait_secs Seconds to wait between file-save retries.
+#' @param target_aliases List of target name mapping lists.
+#' @param update_target_to_canonical Set to TRUE to update Target to the canonical name.
+#' @param audit_dir Location of the audit folder written by the cleaning pipeline.
+#' @param consolidation_log_path Plain-text transcript log path.
+#' @return Invisibly returns the `consolidation_dir` path, allowing for piping.
+#' @export
+run_consolidation_pipeline <- function(
+  input_dir = "outputs/",
+  all_pattern = "_all_samples\\.csv$",
+  review_pattern = "_review_samples\\.csv$",
+  consolidation_dir = "consolidated",
+  all_out_path = NULL,
+  review_out_path = NULL,
+  table_style = "TableStyleMedium2",
+  font_name = "Arial",
+  font_size = 10,
+  col_width_min = 10,
+  max_write_tries = 5,
+  wait_secs = 3,
+  target_aliases = list(uni = c("uni", "universal", "univ")),
+  update_target_to_canonical = TRUE,
+  audit_dir = "audit/",
+  consolidation_log_path = "audit/pcr_consolidation_log.txt"
+) {
+  # Close any stale sinks from a previous pipeline stage
+  while (sink.number() > 0) sink(type = "output")
+
+  # Assign lowercase function arguments to uppercase local variables
+  # to match the existing script naming conventions.
+  input_dir <- input_dir
+  ALL_PATTERN <- all_pattern
+  REVIEW_PATTERN <- review_pattern
+  CONSOLIDATION_DIR <- consolidation_dir
+  TABLE_STYLE <- table_style
+  FONT_NAME <- font_name
+  FONT_SIZE <- font_size
+  COL_WIDTH_MIN <- col_width_min
+  MAX_WRITE_TRIES <- max_write_tries
+  WAIT_SECS <- wait_secs
+  TARGET_ALIASES <- target_aliases
+  UPDATE_TARGET_TO_CANONICAL <- update_target_to_canonical
+  AUDIT_DIR <- audit_dir
+  CONSOLIDATION_LOG_PATH <- consolidation_log_path
+
+  # Resolve paths
+  ALL_OUT_PATH <- if (is.null(all_out_path)) {
+    file.path(CONSOLIDATION_DIR, "qpcr_all_samples.xlsx")
+  } else {
+    all_out_path
+  }
+  REVIEW_OUT_PATH <- if (is.null(review_out_path)) {
+    file.path(CONSOLIDATION_DIR, "qpcr_review_samples.xlsx")
+  } else {
+    review_out_path
+  }
+
 
 if (!is.null(CONSOLIDATION_LOG_PATH)) {
   if (!dir.exists(dirname(CONSOLIDATION_LOG_PATH)))
@@ -793,10 +717,10 @@ if (!is.null(CONSOLIDATION_LOG_PATH)) {
   cat(strrep("-", .pg_width), "\n", sep = "")
   cat(sprintf(" Started  : %s\n", format(.log_start, "%Y-%m-%d %H:%M:%S")))
   cat(sprintf(" User     : %s\n", Sys.info()[["user"]]))
-  cat(sprintf(" Input    : %s\n", INPUT_DIR))
+  cat(sprintf(" Input    : %s\n", input_dir))
   cat(sprintf(" All out  : %s\n", ALL_OUT_PATH))
   cat(sprintf(" Review   : %s\n", REVIEW_OUT_PATH))
-  cat(sprintf(" Version  : %s\n", SCRIPT_VERSION))
+  cat(sprintf(" Version  : %s\n", packageVersion("qpcrpipeline")))
   cat(strrep("=", .pg_width), "\n\n", sep = "")
 }
 
@@ -809,20 +733,20 @@ cat(strrep("-", .pg_width), "\n", sep = "")
 cat(" File discovery\n")
 cat(strrep("-", .pg_width), "\n", sep = "")
 
-if (!dir.exists(INPUT_DIR)) {
-  stop("INPUT_DIR does not exist: ", INPUT_DIR,
-       "\nCheck that the cleaning pipeline has been run and OUTPUT_DIR matches.",
+if (!dir.exists(input_dir)) {
+  stop("input_dir does not exist: ", input_dir,
+       "\nCheck that the cleaning pipeline has been run and output_dir matches.",
        call. = FALSE)
 }
 
-all_files    <- sort(list.files(INPUT_DIR, pattern = ALL_PATTERN,
+all_files    <- sort(list.files(input_dir, pattern = ALL_PATTERN,
                                 full.names = TRUE, recursive = TRUE))
-review_files <- sort(list.files(INPUT_DIR, pattern = REVIEW_PATTERN,
+review_files <- sort(list.files(input_dir, pattern = REVIEW_PATTERN,
                                 full.names = TRUE, recursive = TRUE))
 
 if (length(all_files) == 0 && length(review_files) == 0) {
   stop(
-    "No matching files found in: ", INPUT_DIR,
+    "No matching files found in: ", input_dir,
     "\n  ALL_PATTERN    : ", ALL_PATTERN,
     "\n  REVIEW_PATTERN : ", REVIEW_PATTERN,
     "\nCheck that the cleaning pipeline has been run successfully.",
@@ -1410,14 +1334,20 @@ add_summary_sheet(wb_all,
                   decision_wide  = .summary_decision,
                   standards_tbl  = .summary_standards,
                   all_counts     = .summary_all_counts,
-                  review_counts  = .summary_review_counts)
+                  review_counts  = .summary_review_counts,
+                  font_name      = font_name, 
+                  font_size      = font_size, 
+                  col_width_min  = col_width_min)
 report("+", "run_summary sheet added to all-samples workbook")
 
 add_summary_sheet(wb_review,
                   decision_wide  = .summary_decision,
                   standards_tbl  = .summary_standards,
                   all_counts     = .summary_all_counts,
-                  review_counts  = .summary_review_counts)
+                  review_counts  = .summary_review_counts,
+                  font_name      = font_name, 
+                  font_size      = font_size, 
+                  col_width_min  = col_width_min)
 report("+", "run_summary sheet added to review-samples workbook")
 
 
@@ -1496,4 +1426,6 @@ if (!is.null(CONSOLIDATION_LOG_PATH) && sink.number() > 0) {
   sink(type = "output")
   close(.log_con)
   cat(sprintf("\n  Consolidation log saved to: %s\n", CONSOLIDATION_LOG_PATH))
+}
+  invisible(CONSOLIDATION_DIR)
 }

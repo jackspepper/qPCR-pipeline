@@ -198,7 +198,7 @@ The cleaning pipeline (`qpcr_cleaning_pipeline.R`) is the first script to run. I
 #### Input directory
 
 ```r
-INPUT_DIR <- "RawData/"
+input_dir <- "RawData/"
 ```
 
 This tells the script where to look for your plate CSV files. If you are following the recommended project folder structure, you do not need to change this.
@@ -206,7 +206,7 @@ This tells the script where to look for your plate CSV files. If you are followi
 #### Delta Cq threshold
 
 ```r
-DELTA_CQ_THRESHOLD <- 1.0
+delta_cq_threshold <- 1.0
 ```
 
 Controls how large a difference between duplicate Cq values is acceptable. The default of 1.0 means that if your two replicates differ by more than 1 Cq cycle, the pair is flagged for review. This is a commonly used MIQE-aligned threshold.
@@ -214,7 +214,7 @@ Controls how large a difference between duplicate Cq values is acceptable. The d
 #### Skip completed plates
 
 ```r
-SKIP_COMPLETED <- TRUE
+skip_completed <- TRUE
 ```
 
 When `TRUE`, the script checks whether output files already exist for each plate before processing. If both output CSVs already exist, you will be asked whether to skip that plate or reprocess it.
@@ -222,7 +222,7 @@ When `TRUE`, the script checks whether output files already exist for each plate
 #### Number of standards
 
 ```r
-N_STANDARDS <- 6
+n_standards <- 6
 ```
 
 The number of standard wells expected on each plate. Change this only if your standard curve uses a different number of points.
@@ -402,10 +402,10 @@ After the cleaning pipeline has finished, run the consolidation script (`qpcr_co
 #### Input directory
 
 ```r
-INPUT_DIR <- "outputs/"
+input_dir <- "outputs/"
 ```
 
-This should match the `OUTPUT_DIR` from the cleaning pipeline.
+This should match the `output_dir` from the cleaning pipeline.
 
 #### Output location
 
@@ -616,7 +616,7 @@ This closes the log file connection the script opened. If the problem persists, 
 Check:
 - Your working directory in RStudio is set to the project folder (**Session → Set Working Directory → To Source File Location**)
 - The `RawData` folder exists and contains `.csv` files
-- The `INPUT_DIR` setting in Section 1 matches your actual folder name (case-sensitive on Mac and Linux)
+- The `input_dir` setting in Section 1 matches your actual folder name (case-sensitive on Mac and Linux)
 
 **`Could not find a row with 'Well' in column 1`**
 
@@ -649,8 +649,8 @@ Your plate contains targets with different LOD values (e.g. `uni` and `fucp` on 
 
 Check:
 - Standards in the Content column must be labelled exactly as `Std-001` through `Std-006` (or `Std-01` through `Std-06`). Other formats such as `Standard 1`, `S1`, or `STD001` will not be recognised.
-- If your assay uses a different number of standards, update `N_STANDARDS` in Section 1.
-- If you run standards on a single plate and apply the curve to others, set `STD_CHECK_ENABLED <- FALSE` in Section 1 and provide LOD values via `STD_FORCE_LOD`.
+- If your assay uses a different number of standards, update `n_standards` in Section 1.
+- If you run standards on a single plate and apply the curve to others, set `std_check_enabled <- FALSE` in Section 1 and provide LOD values via `std_force_lod`.
 
 ---
 
@@ -662,7 +662,7 @@ The script retries up to 5 times. This usually means the output file is open in 
 
 **`Error: No matching files found in outputs/`**
 
-Run the cleaning pipeline (Script 1) first, or check that `INPUT_DIR` in the consolidation script matches `OUTPUT_DIR` from the cleaning pipeline.
+Run the cleaning pipeline (Script 1) first, or check that `input_dir` in the consolidation script matches `output_dir` from the cleaning pipeline.
 
 ---
 
@@ -696,10 +696,10 @@ Check:
 
 1. Export plate data from CFX Maestro as CSV (Quantification Results format, no structural modifications)
 2. Rename each file to `YYMMDD_PlateN_[targets].csv` and place in the `RawData/` folder
-3. Open `qpcr_cleaning_pipeline.R` in RStudio. Verify `INPUT_DIR` points to your `RawData` folder
+3. Open `qpcr_cleaning_pipeline.R` in RStudio. Verify `input_dir` points to your `RawData` folder
 4. Press **Ctrl+Shift+Enter** to run Script 1. Respond to any interactive prompts
 5. Check the run summary — confirm all plates show `processed` status and row counts look reasonable
-6. Open `qpcr_consolidation.R`. Verify `INPUT_DIR` is set to `outputs/`
+6. Open `qpcr_consolidation.R`. Verify `input_dir` is set to `outputs/`
 7. Press **Ctrl+Shift+Enter** to run Script 2. Choose O/A/N if prompted about existing workbooks
 8. Open `qpcr_all_samples.xlsx` and `qpcr_review_samples.xlsx` from the `consolidated/` folder
 9. Review any rows in the review workbook and investigate flagged results before using them in your analysis
